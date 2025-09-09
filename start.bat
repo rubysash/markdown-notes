@@ -1,0 +1,1 @@
+start cmd /c "Scripts\activate && python app.py"
