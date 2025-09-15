@@ -65,6 +65,7 @@ A sophisticated, cross-platform markdown editor and file manager built with PyQt
 | File | Purpose | Key Features |
 |------|---------|--------------|
 | `app.py` | Application entry point | GUI styling application, configuration initialization |
+| `clipboard_handler.py` | handles clipboard copy/paste | all images in root/images and renders preview.  Produces md code for you |
 | `gui.py` | Main UI logic and event handling | Tree management, file operations, tab handling, drag-and-drop |
 | `file_manager.py` | File and folder operations | CRUD operations, integrity verification, cross-drive handling |
 | `render.py` | Markdown-to-HTML conversion | CSS management, error handling, fallback systems |
@@ -111,4 +112,26 @@ description: "Brief description"
 ### Prerequisites
 - Python 3.7 or higher
 - PyQt5 with WebEngine support
+
+### Setup Instructions
+
+1. **Clone the Repository**
+   - `git clone https://github.com/rubysash/markdown-notes.git`
+
+2. **Create Virtual Environment**
+   - `python -m venv markdown-notes`
+   - `cd markdown-notes`
+
+3. **Activate Virtual Environment**
+   - On Windows:
+     - `Scripts\activate`
+   - On Linux/macOS:
+     - `source bin/activate`
+
+4. **Install Required Packages**
+   - `python -m pip install -r requirements.txt`
+
+5. **Run the Application**
+   - `python app.py`
+
 
