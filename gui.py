@@ -24,7 +24,7 @@ import render
 class MarkdownManagerApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Markdown Manager - v16")
+        self.setWindowTitle("Markdown Note Taker - v17")
 
         # Initialize config manager
         from config import ConfigManager
@@ -605,10 +605,11 @@ class MarkdownManagerApp(QMainWindow):
                 )
                 return
             
-            # Set the base directory to the current file's directory
-            current_file_dir = os.path.dirname(os.path.abspath(self.current_file))
-            self.clipboard_handler.base_dir = current_file_dir
+            # Set the base directory to the application root (where app.py is)
+            #app_root_dir = os.path.abspath(os.path.dirname(__file__))
+            #self.clipboard_handler.base_dir = app_root_dir
             self.clipboard_handler.ensure_images_folder()
+            app_root_dir = self.clipboard_handler.base_dir  # added 
             
             # Process the clipboard image
             result = self.clipboard_handler.process_clipboard_image()
@@ -627,10 +628,36 @@ class MarkdownManagerApp(QMainWindow):
                 if not ok:
                     alt_text = "Pasted Image"
                 
+                # Calculate relative path from current markdown file to root images folder
+                current_file_dir = os.path.dirname(os.path.abspath(self.current_file))
+                
+                # Get relative path from current file to app root
+                try:
+                    rel_path_to_root = os.path.relpath(app_root_dir, current_file_dir)
+
+                    # Normalize path separators for markdown
+                    rel_path_to_root = rel_path_to_root.replace(os.sep, '/')
+                    
+                    # Build the markdown image path
+                    '''
+                    if rel_path_to_root == '.':
+                        # Same directory as app root
+                        markdown_image_path = relative_path
+                    else:
+                        # Need to navigate to root first
+                        markdown_image_path = f"{rel_path_to_root}/{relative_path}"
+                        # Clean up any redundant slashes or dots
+                        markdown_image_path = markdown_image_path.replace('//', '/')
+                    '''
+                    markdown_image_path = f"/{relative_path}".replace('//', '/')
+                except ValueError:
+                    # Different drives on Windows, use absolute path from root
+                    markdown_image_path = f"/{relative_path}"
+                
                 # Create markdown link
                 markdown_link = self.clipboard_handler.create_markdown_image_link(
                     alt_text, 
-                    relative_path
+                    markdown_image_path
                 )
                 
                 # Insert into editor at cursor position
@@ -659,7 +686,7 @@ class MarkdownManagerApp(QMainWindow):
                 QMessageBox.information(
                     self, 
                     "Image Pasted", 
-                    f"Image saved as: {filename}\nLocation: {relative_path}"
+                    f"Image saved as: {filename}\nLocation: images/{filename}\nMarkdown path: {markdown_image_path}"
                 )
                 
                 # Mark as having unsaved changes

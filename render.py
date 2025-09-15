@@ -2,6 +2,7 @@
 
 import markdown
 import os
+import sys
 
 class CSSManager:
     """Manages CSS loading with simple two-layer fallback system"""
@@ -162,32 +163,40 @@ def markdown_to_html(md_text, custom_css=None, save_temp_file=False, base_dir=No
         # Fix image paths to be absolute for preview
         if base_dir:
             import re
-            
+            import sys
+
             def fix_image_path(match):
                 img_tag = match.group(0)
                 src_match = re.search(r'src="([^"]+)"', img_tag)
-                if src_match:
-                    original_src = src_match.group(1)
-                    
-                    # Skip if already absolute path or URL
-                    if original_src.startswith(('http://', 'https://', 'file:///', '/')):
-                        return img_tag
-                    
-                    # Check if it's the images folder reference
-                    if original_src.startswith('images/'):
-                        # Use base directory of the application, not the markdown file
-                        app_base_dir = os.getcwd()
-                        absolute_path = os.path.join(app_base_dir, original_src)
-                    else:
-                        # For other relative paths, use the markdown file's directory
-                        absolute_path = os.path.join(base_dir, original_src)
-                    
-                    if os.path.exists(absolute_path):
-                        file_url = f"file:///{absolute_path.replace(os.sep, '/')}"
-                        return img_tag.replace(f'src="{original_src}"', f'src="{file_url}"')
+                if not src_match:
+                    return img_tag
                 
-                return img_tag
-            
+                original_src = src_match.group(1)
+
+                # Skip external URLs and file:///
+                if original_src.startswith(('http://', 'https://', 'file:///')):
+                    return img_tag
+
+                # Resolve root-relative paths like /images/foo.png
+                if original_src.startswith('/images/'):
+                    try:
+                        app_root_dir = os.path.abspath(os.path.dirname(sys.modules['__main__'].__file__))
+                        absolute_path = os.path.join(app_root_dir, original_src.lstrip('/'))
+                        if os.path.exists(absolute_path):
+                            file_url = f"file:///{absolute_path.replace(os.sep, '/')}"
+                            return img_tag.replace(f'src="{original_src}"', f'src="{file_url}"')
+                    except Exception as e:
+                        print(f"Failed to resolve /images/ path: {e}")
+                    return img_tag  # fallback
+
+                # For other relative paths (e.g., images/foo.png or ../images/foo.png)
+                absolute_path = os.path.normpath(os.path.join(base_dir, original_src))
+                if os.path.exists(absolute_path):
+                    file_url = f"file:///{absolute_path.replace(os.sep, '/')}"
+                    return img_tag.replace(f'src="{original_src}"', f'src="{file_url}"')
+                
+                return img_tag  # fallback if not found
+
             html_content = re.sub(r'<img[^>]+>', fix_image_path, html_content)
         
         preview_css = css_manager.get_preview_css(custom_css)
@@ -256,7 +265,7 @@ def markdown_to_html(md_text, custom_css=None, save_temp_file=False, base_dir=No
             return _generate_error_html(f"Markdown processing failed: {fallback_error}")
     
     except Exception as e:
-        return _generate_error_html(f"Error rendering markdown: {e}") 
+        return _generate_error_html(f"Error rendering markdown: {e}")
 
 def _generate_error_html(error_message):
     """Generate a styled error HTML page"""

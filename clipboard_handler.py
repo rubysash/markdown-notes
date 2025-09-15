@@ -2,6 +2,7 @@
 
 import os
 import uuid
+import sys
 from datetime import datetime
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtGui import QImage, QPixmap
@@ -14,7 +15,15 @@ class ClipboardImageHandler:
         Initialize clipboard handler with optional base directory.
         If no base_dir provided, uses current working directory.
         """
-        self.base_dir = base_dir or os.getcwd()
+        #self.base_dir = base_dir or os.getcwd()
+        #self.images_folder = "images"
+        #self.ensure_images_folder()
+
+        if base_dir:
+            self.base_dir = base_dir
+        else:
+            self.base_dir = os.path.abspath(os.path.dirname(sys.modules['__main__'].__file__))
+            
         self.images_folder = "images"
         self.ensure_images_folder()
     
