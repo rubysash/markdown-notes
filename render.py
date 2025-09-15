@@ -159,6 +159,37 @@ def markdown_to_html(md_text, custom_css=None, save_temp_file=False, base_dir=No
             extension_configs=extension_configs
         )
         
+        # Fix image paths to be absolute for preview
+        if base_dir:
+            import re
+            
+            def fix_image_path(match):
+                img_tag = match.group(0)
+                src_match = re.search(r'src="([^"]+)"', img_tag)
+                if src_match:
+                    original_src = src_match.group(1)
+                    
+                    # Skip if already absolute path or URL
+                    if original_src.startswith(('http://', 'https://', 'file:///', '/')):
+                        return img_tag
+                    
+                    # Check if it's the images folder reference
+                    if original_src.startswith('images/'):
+                        # Use base directory of the application, not the markdown file
+                        app_base_dir = os.getcwd()
+                        absolute_path = os.path.join(app_base_dir, original_src)
+                    else:
+                        # For other relative paths, use the markdown file's directory
+                        absolute_path = os.path.join(base_dir, original_src)
+                    
+                    if os.path.exists(absolute_path):
+                        file_url = f"file:///{absolute_path.replace(os.sep, '/')}"
+                        return img_tag.replace(f'src="{original_src}"', f'src="{file_url}"')
+                
+                return img_tag
+            
+            html_content = re.sub(r'<img[^>]+>', fix_image_path, html_content)
+        
         preview_css = css_manager.get_preview_css(custom_css)
         
         html = f"""<!DOCTYPE html>
@@ -225,8 +256,8 @@ def markdown_to_html(md_text, custom_css=None, save_temp_file=False, base_dir=No
             return _generate_error_html(f"Markdown processing failed: {fallback_error}")
     
     except Exception as e:
-        return _generate_error_html(f"Error rendering markdown: {e}")
-    
+        return _generate_error_html(f"Error rendering markdown: {e}") 
+
 def _generate_error_html(error_message):
     """Generate a styled error HTML page"""
     error_css = """

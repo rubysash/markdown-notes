@@ -14,7 +14,9 @@ from PyQt5.QtGui import QFont, QKeySequence, QDrag
 from PyQt5.QtCore import QMimeData
 from PyQt5.QtPrintSupport import QPrintDialog, QPrinter
 from PyQt5.QtWebEngineWidgets import QWebEngineView
-from PyQt5.QtWidgets import QHBoxLayout
+from PyQt5.QtWidgets import QHBoxLayout, QInputDialog
+
+from clipboard_handler import ClipboardImageHandler
 
 import file_manager
 import render
@@ -22,11 +24,14 @@ import render
 class MarkdownManagerApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Markdown Manager - PyQt")
+        self.setWindowTitle("Markdown Manager - v16")
 
         # Initialize config manager
         from config import ConfigManager
         self.config_manager = ConfigManager()
+
+        # Initialize clipboard handler
+        self.clipboard_handler = ClipboardImageHandler()
 
         # Track unsaved changes
         self.has_unsaved_changes = False
@@ -118,6 +123,33 @@ class MarkdownManagerApp(QMainWindow):
         
         left_layout.addWidget(special_button_row)
 
+        # Add image paste button row
+        image_button_row = QWidget()
+        image_layout = QHBoxLayout()
+        image_button_row.setLayout(image_layout)
+        
+        paste_image_btn = QPushButton("Paste Image (Ctrl+Shift+V)")
+        paste_image_btn.clicked.connect(self.paste_image_from_clipboard)
+        paste_image_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #8e44ad;
+                color: #f0f0f0;
+                border: 1px solid #333;
+                padding: 8px 12px;
+                border-radius: 3px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #9b59b6;
+            }
+            QPushButton:pressed {
+                background-color: #7d3c98;
+            }
+        """)
+        image_layout.addWidget(paste_image_btn)
+        
+        left_layout.addWidget(image_button_row)
+
         # Keybinds
         # Keyboard shortcut for save
         save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
@@ -130,6 +162,10 @@ class MarkdownManagerApp(QMainWindow):
         # Ctrl+N for creating new file in current directory
         new_file_shortcut = QShortcut(QKeySequence("Ctrl+N"), self)
         new_file_shortcut.activated.connect(self.handle_new_file_shortcut)
+
+        # Ctrl+Shift+V for pasting images from clipboard
+        paste_image_shortcut = QShortcut(QKeySequence("Ctrl+Shift+V"), self)
+        paste_image_shortcut.activated.connect(self.paste_image_from_clipboard)
 
         splitter.addWidget(left_panel)
         self.load_tree(".")
@@ -182,6 +218,83 @@ class MarkdownManagerApp(QMainWindow):
         splitter.setChildrenCollapsible(True)
         left_panel.setMinimumSize(150, 0)
         self.tab_widget.setMinimumSize(300, 0)
+
+    def handle_paste_event(self):
+        """Handle paste event for images and text"""
+        try:
+            # Check if clipboard contains an image
+            if self.clipboard_handler.has_image_in_clipboard():
+                # Process the image
+                result = self.clipboard_handler.process_clipboard_image()
+                
+                if result:
+                    relative_path, full_path = result
+                    
+                    # Get cursor position
+                    cursor = self.editor.textCursor()
+                    
+                    # Ask for alt text (optional)
+                    from PyQt5.QtWidgets import QInputDialog
+                    alt_text, ok = QInputDialog.getText(
+                        self, 
+                        "Image Description", 
+                        "Enter alt text for the image (optional):",
+                        text="Image"
+                    )
+                    
+                    if not ok:
+                        alt_text = "Image"
+                    
+                    # Create markdown link
+                    markdown_link = self.clipboard_handler.create_markdown_image_link(
+                        alt_text, 
+                        relative_path
+                    )
+                    
+                    # Insert at cursor position
+                    cursor.insertText(markdown_link)
+                    
+                    # Update preview
+                    self.update_rendered_view()
+                    
+                    # Show success message
+                    from PyQt5.QtWidgets import QMessageBox
+                    QMessageBox.information(
+                        self, 
+                        "Image Pasted", 
+                        f"Image saved to: {relative_path}"
+                    )
+                else:
+                    from PyQt5.QtWidgets import QMessageBox
+                    QMessageBox.warning(
+                        self, 
+                        "Paste Failed", 
+                        "Failed to save image from clipboard"
+                    )
+            else:
+                # Let default paste behavior handle text
+                self.editor.paste()
+                
+        except Exception as e:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.critical(
+                self, 
+                "Paste Error", 
+                f"Error during paste operation: {str(e)}"
+            )
+    
+    def keyPressEvent(self, event):
+        """Override key press event to handle Ctrl+V"""
+        from PyQt5.QtCore import Qt
+        from PyQt5.QtGui import QKeySequence
+        
+        # Check if Ctrl+V is pressed and editor has focus
+        if (event.matches(QKeySequence.Paste) and 
+            self.editor.hasFocus()):
+            self.handle_paste_event()
+        else:
+            # Pass to parent for default handling
+            super().keyPressEvent(event)
 
     def handle_rename_shortcut(self):
         selected_item = self.tree.currentItem()
@@ -470,7 +583,103 @@ class MarkdownManagerApp(QMainWindow):
                 "Unexpected Error", 
                 f"An unexpected error occurred:\n{str(e)}"
             )
+
+    def paste_image_from_clipboard(self):
+        """Handle pasting image from clipboard into markdown"""
+        try:
+            # Check if we have a file open
+            if not self.current_file:
+                QMessageBox.warning(
+                    self, 
+                    "No File Open", 
+                    "Please open a markdown file before pasting an image."
+                )
+                return
             
+            # Check if clipboard has an image
+            if not self.clipboard_handler.has_image_in_clipboard():
+                QMessageBox.information(
+                    self, 
+                    "No Image", 
+                    "No image found in clipboard.\nCopy an image first, then use Ctrl+Shift+V to paste."
+                )
+                return
+            
+            # Set the base directory to the current file's directory
+            current_file_dir = os.path.dirname(os.path.abspath(self.current_file))
+            self.clipboard_handler.base_dir = current_file_dir
+            self.clipboard_handler.ensure_images_folder()
+            
+            # Process the clipboard image
+            result = self.clipboard_handler.process_clipboard_image()
+            
+            if result:
+                relative_path, absolute_path = result
+                
+                # Ask user for alt text
+                alt_text, ok = QInputDialog.getText(
+                    self, 
+                    "Image Description", 
+                    "Enter alt text for the image (optional):",
+                    text="Pasted Image"
+                )
+                
+                if not ok:
+                    alt_text = "Pasted Image"
+                
+                # Create markdown link
+                markdown_link = self.clipboard_handler.create_markdown_image_link(
+                    alt_text, 
+                    relative_path
+                )
+                
+                # Insert into editor at cursor position
+                cursor = self.editor.textCursor()
+                
+                # Add newlines if needed
+                current_text = self.editor.toPlainText()
+                cursor_pos = cursor.position()
+                
+                # Check if we need newlines before
+                if cursor_pos > 0 and current_text[cursor_pos - 1] != '\n':
+                    markdown_link = '\n' + markdown_link
+                
+                # Check if we need newlines after
+                if cursor_pos < len(current_text) and current_text[cursor_pos] != '\n':
+                    markdown_link = markdown_link + '\n'
+                
+                # Insert the markdown
+                cursor.insertText(markdown_link)
+                
+                # Update the preview
+                self.update_rendered_view()
+                
+                # Show success message
+                filename = os.path.basename(absolute_path)
+                QMessageBox.information(
+                    self, 
+                    "Image Pasted", 
+                    f"Image saved as: {filename}\nLocation: {relative_path}"
+                )
+                
+                # Mark as having unsaved changes
+                self.has_unsaved_changes = True
+                self.update_save_button_style()
+                
+            else:
+                QMessageBox.critical(
+                    self, 
+                    "Paste Failed", 
+                    "Failed to save the image from clipboard.\nPlease try again."
+                )
+                
+        except Exception as e:
+            QMessageBox.critical(
+                self, 
+                "Error", 
+                f"An error occurred while pasting the image:\n{str(e)}"
+            )
+
     # Context aware stuff
     def show_context_menu(self, position):
         selected_item = self.tree.itemAt(position)
@@ -578,26 +787,49 @@ class MarkdownManagerApp(QMainWindow):
                 QMessageBox.warning(self, "Error", "File already exists.")
             else:
                 try:
-                    # Store state for restoration
+                    # Store complete state
                     expanded_paths = self.tree.get_expanded_paths()
                     current_selection = None
                     if self.tree.currentItem():
                         current_selection = self.get_full_path(self.tree.currentItem())
                     
+                    scroll_bar = self.tree.verticalScrollBar()
+                    scroll_position = scroll_bar.value()
+                    
+                    # Create the file
                     file_manager.create_new_file(target_path, sanitized_name)
                     
                     # Refresh and restore state
                     if self.tree.refresh_directory_node(target_path):
                         self.tree.restore_expanded_state(expanded_paths)
-                        # Select the newly created file
+                        
+                        # Ensure parent is expanded
+                        parent_item = self.tree.find_item_by_path(target_path)
+                        if parent_item and not parent_item.isExpanded():
+                            parent_item.setExpanded(True)
+                        
+                        # Select and open the new file
                         new_item = self.tree.find_item_by_path(new_file_path)
                         if new_item:
                             self.tree.setCurrentItem(new_item)
                             self.tree.scrollToItem(new_item)
                             # Auto-open the new file
                             self.load_file_by_path(new_file_path)
+                        else:
+                            # Restore previous state if new item not found
+                            if current_selection:
+                                selection_item = self.tree.find_item_by_path(current_selection)
+                                if selection_item:
+                                    self.tree.setCurrentItem(selection_item)
+                            scroll_bar.setValue(scroll_position)
                     else:
                         self.load_tree(".")
+                        self.tree.restore_expanded_state(expanded_paths)
+                        new_item = self.tree.find_item_by_path(new_file_path)
+                        if new_item:
+                            self.tree.setCurrentItem(new_item)
+                            self.tree.scrollToItem(new_item)
+                            self.load_file_by_path(new_file_path)
                         
                 except Exception as e:
                     QMessageBox.critical(self, "Error", f"Failed to create file:\n{str(e)}")
@@ -630,24 +862,54 @@ class MarkdownManagerApp(QMainWindow):
                 QMessageBox.warning(self, "Error", "Folder already exists.")
             else:
                 try:
-                    # Store state for restoration
+                    # Store complete state before any operations
                     expanded_paths = self.tree.get_expanded_paths()
                     current_selection = None
                     if self.tree.currentItem():
                         current_selection = self.get_full_path(self.tree.currentItem())
                     
+                    # Store scroll position
+                    scroll_bar = self.tree.verticalScrollBar()
+                    scroll_position = scroll_bar.value()
+                    
+                    # Create the folder
                     file_manager.create_new_folder(target_path, sanitized_name)
                     
-                    # Refresh and restore state
-                    if self.tree.refresh_directory_node(target_path):
+                    # Try selective refresh first
+                    refresh_success = self.tree.refresh_directory_node(target_path)
+                    
+                    if refresh_success:
+                        # Restore expanded state for all previously expanded paths
                         self.tree.restore_expanded_state(expanded_paths)
+                        
+                        # Ensure parent of new folder is expanded
+                        parent_item = self.tree.find_item_by_path(target_path)
+                        if parent_item and not parent_item.isExpanded():
+                            parent_item.setExpanded(True)
+                        
                         # Select the newly created folder
                         new_item = self.tree.find_item_by_path(new_folder_path)
                         if new_item:
                             self.tree.setCurrentItem(new_item)
                             self.tree.scrollToItem(new_item)
+                        elif current_selection:
+                            # Fall back to previous selection if new item not found
+                            selection_item = self.tree.find_item_by_path(current_selection)
+                            if selection_item:
+                                self.tree.setCurrentItem(selection_item)
+                        
+                        # Restore scroll position if no specific item to scroll to
+                        if not new_item:
+                            scroll_bar.setValue(scroll_position)
                     else:
+                        # Full refresh as fallback
                         self.load_tree(".")
+                        # After full refresh, still try to restore state
+                        self.tree.restore_expanded_state(expanded_paths)
+                        new_item = self.tree.find_item_by_path(new_folder_path)
+                        if new_item:
+                            self.tree.setCurrentItem(new_item)
+                            self.tree.scrollToItem(new_item)
                         
                 except Exception as e:
                     QMessageBox.critical(self, "Error", f"Failed to create folder:\n{str(e)}")
@@ -752,21 +1014,47 @@ class MarkdownManagerApp(QMainWindow):
                 QMessageBox.warning(self, "Error", "Folder already exists.")
             else:
                 try:
+                    # Capture complete state including scroll position
                     expanded_paths = self.tree.get_expanded_paths()
                     current_selection = None
                     if self.tree.currentItem():
                         current_selection = self.get_full_path(self.tree.currentItem())
                     
+                    scroll_bar = self.tree.verticalScrollBar()
+                    scroll_position = scroll_bar.value()
+                    
+                    # Create the folder
                     file_manager.create_new_folder(path, sanitized_name)
                     
+                    # Try selective refresh
                     if self.tree.refresh_directory_node(path):
+                        # Restore all expanded paths
                         self.tree.restore_expanded_state(expanded_paths)
-                        if current_selection:
+                        
+                        # Ensure parent is expanded to show new folder
+                        parent_item = self.tree.find_item_by_path(path)
+                        if parent_item and not parent_item.isExpanded():
+                            parent_item.setExpanded(True)
+                        
+                        # Select the new folder
+                        new_item = self.tree.find_item_by_path(new_folder_path)
+                        if new_item:
+                            self.tree.setCurrentItem(new_item)
+                            self.tree.scrollToItem(new_item)
+                        elif current_selection:
+                            # Restore previous selection if new item not found
                             selection_item = self.tree.find_item_by_path(current_selection)
                             if selection_item:
                                 self.tree.setCurrentItem(selection_item)
+                                scroll_bar.setValue(scroll_position)
                     else:
+                        # Fallback to full refresh
                         self.load_tree(".")
+                        self.tree.restore_expanded_state(expanded_paths)
+                        new_item = self.tree.find_item_by_path(new_folder_path)
+                        if new_item:
+                            self.tree.setCurrentItem(new_item)
+                            self.tree.scrollToItem(new_item)
                             
                 except Exception as e:
                     QMessageBox.critical(self, "Error", f"Failed to create folder:\n{str(e)}")
@@ -1447,16 +1735,35 @@ class MarkdownTreeWidget(QTreeWidget):
 
     def restore_expanded_state(self, expanded_paths):
         """Restore expanded state for given paths"""
+        if not expanded_paths:
+            return
+        
         def expand_items(item):
             path = self.get_full_path(item)
-            if path in expanded_paths:
+            if path and path in expanded_paths:
+                # First ensure all children are loaded if this is a lazy-loaded item
+                if item.childCount() == 1 and item.child(0).text(0) == "Loading...":
+                    # Trigger lazy loading by simulating expansion
+                    item.removeChild(item.child(0))
+                    parent_widget = self.parent()
+                    if hasattr(parent_widget, 'add_lazy_children'):
+                        parent_widget.add_lazy_children(item, path)
+                
+                # Now expand the item
                 item.setExpanded(True)
             
+            # Process all children
             for i in range(item.childCount()):
-                expand_items(item.child(i))
+                child = item.child(i)
+                if child.text(0) != "Loading...":  # Skip placeholder items
+                    expand_items(child)
         
+        # Process all top-level items
         for i in range(self.topLevelItemCount()):
             expand_items(self.topLevelItem(i))
+        
+        # Force a visual update
+        self.update()
 
     def find_item_by_path(self, target_path):
         """Find tree item by its full path with improved reliability"""
