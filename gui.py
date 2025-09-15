@@ -889,55 +889,51 @@ class MarkdownManagerApp(QMainWindow):
                 QMessageBox.warning(self, "Error", "Folder already exists.")
             else:
                 try:
-                    # Store complete state before any operations
+                    # Store state before any operations
                     expanded_paths = self.tree.get_expanded_paths()
                     current_selection = None
                     if self.tree.currentItem():
                         current_selection = self.get_full_path(self.tree.currentItem())
                     
-                    # Store scroll position
-                    scroll_bar = self.tree.verticalScrollBar()
-                    scroll_position = scroll_bar.value()
-                    
                     # Create the folder
                     file_manager.create_new_folder(target_path, sanitized_name)
                     
-                    # Try selective refresh first
+                    # Always use selective refresh for folder creation
                     refresh_success = self.tree.refresh_directory_node(target_path)
                     
                     if refresh_success:
-                        # Restore expanded state for all previously expanded paths
-                        self.tree.restore_expanded_state(expanded_paths)
-                        
-                        # Ensure parent of new folder is expanded
+                        # Ensure parent is expanded to show new folder
                         parent_item = self.tree.find_item_by_path(target_path)
                         if parent_item and not parent_item.isExpanded():
                             parent_item.setExpanded(True)
                         
                         # Select the newly created folder
-                        new_item = self.tree.find_item_by_path(new_folder_path)
-                        if new_item:
-                            self.tree.setCurrentItem(new_item)
-                            self.tree.scrollToItem(new_item)
-                        elif current_selection:
-                            # Fall back to previous selection if new item not found
-                            selection_item = self.tree.find_item_by_path(current_selection)
-                            if selection_item:
-                                self.tree.setCurrentItem(selection_item)
+                        from PyQt5.QtCore import QTimer
+                        def select_new_folder():
+                            new_item = self.tree.find_item_by_path(new_folder_path)
+                            if new_item:
+                                self.tree.setCurrentItem(new_item)
+                                self.tree.scrollToItem(new_item)
                         
-                        # Restore scroll position if no specific item to scroll to
-                        if not new_item:
-                            scroll_bar.setValue(scroll_position)
+                        # Use timer to ensure tree is fully updated before selection
+                        QTimer.singleShot(100, select_new_folder)
+                        
                     else:
-                        # Full refresh as fallback
+                        print("Selective refresh failed, falling back to full refresh")
+                        # Full refresh fallback
                         self.load_tree(".")
-                        # After full refresh, still try to restore state
                         self.tree.restore_expanded_state(expanded_paths)
-                        new_item = self.tree.find_item_by_path(new_folder_path)
-                        if new_item:
-                            self.tree.setCurrentItem(new_item)
-                            self.tree.scrollToItem(new_item)
                         
+                        # Try to select new folder after full refresh
+                        from PyQt5.QtCore import QTimer
+                        def select_after_full_refresh():
+                            new_item = self.tree.find_item_by_path(new_folder_path)
+                            if new_item:
+                                self.tree.setCurrentItem(new_item)
+                                self.tree.scrollToItem(new_item)
+                        
+                        QTimer.singleShot(200, select_after_full_refresh)
+                            
                 except Exception as e:
                     QMessageBox.critical(self, "Error", f"Failed to create folder:\n{str(e)}")
 
@@ -1290,49 +1286,6 @@ class MarkdownManagerApp(QMainWindow):
                 else:
                     # Try to restore scroll position if selection not found
                     scroll_bar.setValue(scroll_position)
-            
-            # Show brief success feedback
-            self.refresh_tree_btn.setText("Refreshed!")
-            
-            # Use QTimer to reset button text after a short delay
-            from PyQt5.QtCore import QTimer
-            QTimer.singleShot(1000, lambda: self.reset_refresh_button())
-            
-        except Exception as e:
-            QMessageBox.warning(self, "Refresh Error", f"Failed to refresh tree:\n{str(e)}")
-            self.reset_refresh_button()
-
-    def refresh_tree_preserve_state2(self):
-        """Refresh the entire tree while preserving expanded state and current selection"""
-        try:
-            # Store current state
-            expanded_paths = self.tree.get_expanded_paths()
-            current_selection_path = None
-            
-            if self.tree.currentItem():
-                current_selection_path = self.get_full_path(self.tree.currentItem())
-            
-            # Temporarily disable the button and change text to show activity
-            self.refresh_tree_btn.setText("Refreshing...")
-            self.refresh_tree_btn.setEnabled(False)
-            
-            # Force update UI to show the button state change
-            from PyQt5.QtCore import QCoreApplication
-            QCoreApplication.processEvents()
-            
-            # Perform full tree reload
-            self.load_tree(".")
-            
-            # Restore expanded state
-            if expanded_paths:
-                self.tree.restore_expanded_state(expanded_paths)
-            
-            # Restore selection if possible
-            if current_selection_path:
-                selection_item = self.tree.find_item_by_path(current_selection_path)
-                if selection_item:
-                    self.tree.setCurrentItem(selection_item)
-                    self.tree.scrollToItem(selection_item)
             
             # Show brief success feedback
             self.refresh_tree_btn.setText("Refreshed!")
@@ -1822,6 +1775,13 @@ class MarkdownTreeWidget(QTreeWidget):
         else:
             event.ignore()
 
+    def get_main_window(self):
+        """Get reference to the main window"""
+        parent = self.parent()
+        while parent and not hasattr(parent, 'add_lazy_children'):
+            parent = parent.parent()
+        return parent
+
     def get_full_path(self, item):
         """Get the full path stored in the item's data"""
         return item.data(0, Qt.UserRole) or ""
@@ -1845,35 +1805,59 @@ class MarkdownTreeWidget(QTreeWidget):
         return expanded_paths
 
     def restore_expanded_state(self, expanded_paths):
-        """Restore expanded state for given paths"""
+        """Restore expanded state for given paths with proper lazy loading"""
         if not expanded_paths:
             return
         
-        def expand_items(item):
-            path = self.get_full_path(item)
-            if path and path in expanded_paths:
-                # First ensure all children are loaded if this is a lazy-loaded item
-                if item.childCount() == 1 and item.child(0).text(0) == "Loading...":
-                    # Trigger lazy loading by simulating expansion
-                    item.removeChild(item.child(0))
-                    parent_widget = self.parent()
-                    if hasattr(parent_widget, 'add_lazy_children'):
-                        parent_widget.add_lazy_children(item, path)
+        # Convert to list and sort by depth (shorter paths first)
+        # This ensures parent directories are expanded before children
+        paths_by_depth = sorted(expanded_paths, key=lambda p: p.count(os.sep))
+        
+        for target_path in paths_by_depth:
+            if not os.path.exists(target_path):
+                continue
                 
-                # Now expand the item
-                item.setExpanded(True)
+            item = self.find_item_by_path(target_path)
+            if not item:
+                continue
             
-            # Process all children
-            for i in range(item.childCount()):
-                child = item.child(i)
-                if child.text(0) != "Loading...":  # Skip placeholder items
-                    expand_items(child)
+            # Ensure all parent items are expanded first
+            parent_items = []
+            current_item = item.parent()
+            while current_item:
+                parent_items.insert(0, current_item)
+                current_item = current_item.parent()
+            
+            # Expand parents first, triggering lazy loading as needed
+            for parent_item in parent_items:
+                if not parent_item.isExpanded():
+                    # Check if needs lazy loading
+                    if (parent_item.childCount() == 1 and 
+                        parent_item.child(0).text(0) == "Loading..."):
+                        parent_item.removeChild(parent_item.child(0))
+                        parent_path = self.get_full_path(parent_item)
+                        if parent_path and os.path.isdir(parent_path):
+                            main_window = self.get_main_window()
+                            if main_window:
+                                main_window.add_lazy_children(parent_item, parent_path)
+                    
+                    parent_item.setExpanded(True)
+            
+            # Now expand the target item itself
+            if not item.isExpanded():
+                # Check if needs lazy loading
+                if (item.childCount() == 1 and 
+                    item.child(0).text(0) == "Loading..."):
+                    item.removeChild(item.child(0))
+                    item_path = self.get_full_path(item)
+                    if item_path and os.path.isdir(item_path):
+                        main_window = self.get_main_window()
+                        if main_window:
+                            main_window.add_lazy_children(item, item_path)
+                
+                item.setExpanded(True)
         
-        # Process all top-level items
-        for i in range(self.topLevelItemCount()):
-            expand_items(self.topLevelItem(i))
-        
-        # Force a visual update
+        # Force visual update
         self.update()
 
     def find_item_by_path(self, target_path):
@@ -1917,18 +1901,25 @@ class MarkdownTreeWidget(QTreeWidget):
             return False
         
         try:
-            # Store expanded state of all children before refresh
-            children_expanded_state = {}
-            for i in range(dir_item.childCount()):
-                child = dir_item.child(i)
-                child_path = self.get_full_path(child)
-                if child_path:
-                    children_expanded_state[child_path] = child.isExpanded()
+            # Store expanded state of all descendants, not just direct children
+            descendant_expanded_state = {}
+            
+            def collect_expanded_state(item, state_dict):
+                item_path = self.get_full_path(item)
+                if item_path and item.isExpanded():
+                    state_dict[item_path] = True
+                
+                for i in range(item.childCount()):
+                    child = item.child(i)
+                    if child.text(0) != "Loading...":
+                        collect_expanded_state(child, state_dict)
+            
+            collect_expanded_state(dir_item, descendant_expanded_state)
             
             # Store the main directory's expanded state
             was_expanded = dir_item.isExpanded()
             
-            # Clear all children first to remove any "Loading..." placeholders
+            # Clear all children
             dir_item.takeChildren()
             
             # Get current directory contents from filesystem
@@ -1939,17 +1930,15 @@ class MarkdownTreeWidget(QTreeWidget):
                     if os.path.isdir(item_path) or item_path.endswith(".md"):
                         items.append((item, item_path, os.path.isdir(item_path)))
             except (PermissionError, OSError) as e:
-                # Handle permission errors gracefully
-                error_item = QTreeWidgetItem([f"❌ Error: Access Denied"])
+                error_item = QTreeWidgetItem([f"⚠ Error: Access Denied"])
                 dir_item.addChild(error_item)
                 return False
             
             # Sort: directories first, then files, both alphabetically
             items.sort(key=lambda x: (not x[2], x[0].lower()))
             
-            # Create new tree items with proper icons
+            # Create new tree items
             for item_name, item_path, is_dir in items:
-                # Add emoji prefix based on type
                 if is_dir:
                     display_name = f"📁 {item_name}"
                 else:
@@ -1959,7 +1948,7 @@ class MarkdownTreeWidget(QTreeWidget):
                 tree_item.setData(0, Qt.UserRole, item_path)
                 dir_item.addChild(tree_item)
                 
-                # Add placeholder for directories to show expand arrow
+                # Add placeholder for directories that have children
                 if is_dir:
                     try:
                         has_children = any(
@@ -1971,19 +1960,17 @@ class MarkdownTreeWidget(QTreeWidget):
                             placeholder = QTreeWidgetItem(["Loading..."])
                             tree_item.addChild(placeholder)
                     except (PermissionError, OSError):
-                        # If we can't read the directory, don't add placeholder
                         pass
-                
-                # Restore expanded state for this child
-                if item_path in children_expanded_state and children_expanded_state[item_path]:
-                    tree_item.setExpanded(True)
-                    # If this child was expanded, we need to load its children too
-                    if is_dir:
-                        self.add_lazy_children(tree_item, item_path)
             
-            # Restore main directory expanded state
+            # Restore main directory expanded state first
             if was_expanded:
                 dir_item.setExpanded(True)
+            
+            # Restore expanded state for descendants
+            if descendant_expanded_state:
+                # Use a small delay to ensure tree is fully rendered
+                from PyQt5.QtCore import QTimer
+                QTimer.singleShot(50, lambda: self.restore_expanded_state(descendant_expanded_state))
             
             return True
             
@@ -2241,180 +2228,3 @@ class MarkdownTreeWidget(QTreeWidget):
             QMessageBox.critical(self, "Error", f"Failed to move item:\n{str(e)}")
             event.ignore()
 
-    def dropEvent2(self, event):
-        try:
-            source_path = event.mimeData().text()
-            
-            # Validate source is either .md file or directory
-            if not ((os.path.isfile(source_path) and source_path.endswith(".md")) or os.path.isdir(source_path)):
-                QMessageBox.warning(self, "Error", "Only .md files and folders can be moved.")
-                event.ignore()
-                return
-
-            # Get the target item where the file/folder is being dropped
-            target_item = self.itemAt(event.pos())
-            if not target_item:
-                event.ignore()
-                return
-
-            # Get the full path of the target
-            target_path = self.get_full_path(target_item)
-            
-            # If target is a file, use its parent directory
-            if os.path.isfile(target_path):
-                target_path = os.path.dirname(target_path)
-            
-            # Validate target is a directory
-            if not os.path.isdir(target_path):
-                QMessageBox.warning(self, "Error", "Invalid drop target.")
-                event.ignore()
-                return
-
-            # Special validation for folder moves: prevent moving into own subfolder
-            if os.path.isdir(source_path):
-                # Normalize paths for comparison
-                norm_source = os.path.normpath(source_path)
-                norm_target = os.path.normpath(target_path)
-                
-                # Check if target is within source (would create infinite loop)
-                if norm_target.startswith(norm_source + os.sep) or norm_target == norm_source:
-                    QMessageBox.warning(self, "Error", "Cannot move a folder into itself or its subfolder.")
-                    event.ignore()
-                    return
-
-            # Get source directory for refresh purposes
-            source_dir = os.path.dirname(source_path)
-
-            # Create the new path
-            new_path = os.path.join(target_path, os.path.basename(source_path))
-
-            # Check if source and target are the same
-            if source_path == new_path:
-                event.ignore()
-                return
-
-            # Check if item already exists in target location
-            if os.path.exists(new_path):
-                item_type = "folder" if os.path.isdir(source_path) else "file"
-                QMessageBox.warning(self, "Error", f"A {item_type} with this name already exists in the target folder.")
-                event.ignore()
-                return
-
-            # Store current tree state BEFORE the move operation
-            expanded_paths = self.get_expanded_paths()
-            current_selection_path = self.get_full_path(self.currentItem()) if self.currentItem() else None
-
-            # Determine if we need to use cross-drive operations
-            try:
-                from utils import confirm_move_operation
-                import file_manager
-                
-                # Check if this is a cross-drive operation
-                is_cross_drive = file_manager.check_cross_drive_operation(source_path, new_path)
-                
-                if is_cross_drive:
-                    # For cross-drive operations, show confirmation dialog
-                    proceed, verify_integrity = confirm_move_operation(source_path, new_path, self)
-                    if not proceed:
-                        event.ignore()
-                        return
-            except ImportError:
-                # Fallback if utils not available
-                is_cross_drive = False
-
-            # Perform the move operation
-            try:
-                if is_cross_drive:
-                    # Use shutil.move for cross-drive operations
-                    import shutil
-                    shutil.move(source_path, new_path)
-                else:
-                    # Use efficient rename for same-drive operations
-                    os.rename(source_path, new_path)
-                    
-            except (OSError, IOError) as e:
-                QMessageBox.critical(self, "Move Error", f"Failed to move item:\n{str(e)}")
-                event.ignore()
-                return
-            
-            # Find the main application window (MarkdownManagerApp)
-            main_window = self.parent()
-            while main_window and not hasattr(main_window, 'load_tree'):
-                main_window = main_window.parent()
-            
-            # Update current file reference if it was moved
-            if main_window and hasattr(main_window, 'current_file') and main_window.current_file:
-                if main_window.current_file == source_path:
-                    main_window.current_file = new_path
-                elif os.path.isdir(source_path) and main_window.current_file.startswith(source_path + os.sep):
-                    # Update file path if it was inside a moved directory
-                    relative_path = os.path.relpath(main_window.current_file, source_path)
-                    main_window.current_file = os.path.join(new_path, relative_path)
-            
-            # Perform tree refresh - use the exact same approach as the refresh button
-            if main_window and hasattr(main_window, 'load_tree'):
-                try:
-                    # Clear and reload the entire tree (same as refresh button)
-                    main_window.load_tree(".")
-                    
-                    # Restore expanded state
-                    if expanded_paths:
-                        self.restore_expanded_state(expanded_paths)
-                    
-                    # Handle selection restoration
-                    selection_restored = False
-                    
-                    # If the moved item was originally selected, select it in new location
-                    if current_selection_path == source_path:
-                        moved_item = self.find_item_by_path(new_path)
-                        if moved_item:
-                            self.setCurrentItem(moved_item)
-                            self.scrollToItem(moved_item)
-                            selection_restored = True
-                    elif current_selection_path and os.path.isdir(source_path) and current_selection_path.startswith(source_path + os.sep):
-                        # If selected item was inside moved directory, update its path
-                        relative_path = os.path.relpath(current_selection_path, source_path)
-                        new_selection_path = os.path.join(new_path, relative_path)
-                        moved_item = self.find_item_by_path(new_selection_path)
-                        if moved_item:
-                            self.setCurrentItem(moved_item)
-                            self.scrollToItem(moved_item)
-                            selection_restored = True
-                    
-                    # If we couldn't restore selection to moved item, try original selection
-                    if not selection_restored and current_selection_path:
-                        selection_item = self.find_item_by_path(current_selection_path)
-                        if selection_item:
-                            self.setCurrentItem(selection_item)
-                            self.scrollToItem(selection_item)
-                    
-                    # Force UI update
-                    self.update()
-                    if main_window:
-                        main_window.update()
-                    
-                    print(f"Tree refreshed after moving {source_path} to {new_path}")
-                    
-                except Exception as refresh_error:
-                    print(f"Tree refresh failed: {refresh_error}")
-                    # If automatic refresh fails, highlight the refresh button
-                    if hasattr(main_window, 'refresh_tree_btn'):
-                        main_window.refresh_tree_btn.setStyleSheet("""
-                            QPushButton {
-                                background-color: #ff8c00;
-                                color: #f0f0f0;
-                                border: 1px solid #333;
-                                padding: 8px 12px;
-                                border-radius: 3px;
-                                font-weight: bold;
-                            }
-                        """)
-                        main_window.refresh_tree_btn.setText("Refresh Needed")
-            else:
-                print("Could not find main window for tree refresh")
-            
-            event.acceptProposedAction()
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to move item:\n{str(e)}")
-            event.ignore()
