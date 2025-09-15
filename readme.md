@@ -6,7 +6,7 @@ A sophisticated, cross-platform markdown editor and file manager built with PyQt
 
 ## Application Preview
 
-![Markdown Manager Demo1](mm.v12.gif)
+![Markdown Manager Demo1](demov17.gif)
 
 ---
 
@@ -28,6 +28,9 @@ A sophisticated, cross-platform markdown editor and file manager built with PyQt
 - **Smart Filename Sanitization**: Automatic cleanup of invalid characters with user confirmation
 - **Selective Tree Refresh**: Efficient updates that preserve expanded state and selection
 - **Lazy Loading**: Performance-optimized tree expansion with on-demand content loading
+
+### Images
+- **Paste images** - saves to relative root/images folder
 
 ### Safety & Security Features
 - **File Integrity Verification**: MD5 checksums for cross-drive operations with progress tracking
