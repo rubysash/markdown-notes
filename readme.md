@@ -144,5 +144,6 @@ description: "Brief description"
 - git up or repo sync for backups
 - more context menus and hot keys depending on work flow
 - remove/consolidate css/templates vs multiple locations
+- small task tracker that reminds on specific notes
 
 
