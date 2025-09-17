@@ -159,17 +159,3 @@ $$
 E = mc^2
 $$
 ```
-
-## Dataview (if plugin enabled)
-```
-```dataview
-table status, due
-from "Tasks"
-where status != "done"
-sort due asc
-```
-```
-
----
-
-> Paste this in Obsidian for a complete Markdown reference.
