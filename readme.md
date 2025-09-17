@@ -145,5 +145,6 @@ description: "Brief description"
 - more context menus and hot keys depending on work flow
 - remove/consolidate css/templates vs multiple locations
 - small task tracker that reminds on specific notes
+- Test on Pi/Debian
 
 
