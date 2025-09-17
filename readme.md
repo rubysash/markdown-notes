@@ -134,4 +134,15 @@ description: "Brief description"
 5. **Run the Application**
    - `python app.py`
 
+## To Do
+
+- Code refactor, clean up, make DRY
+- Separate out gui into multiple files
+- Clean up documentation to match final project/goals
+- Config tab to default open doc folder, save image folder, etc
+- Word count in gui to assist with writing blog/specific count articles
+- git up or repo sync for backups
+- more context menus and hot keys depending on work flow
+- remove/consolidate css/templates vs multiple locations
+
 
