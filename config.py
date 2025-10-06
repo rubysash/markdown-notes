@@ -5,13 +5,15 @@ from datetime import datetime
 
 class ConfigManager:
     def __init__(self):
+        self.app_version = "1.0.0"
         self.user_css_dir = "css/user"
         self.preview_css_file = os.path.join(self.user_css_dir, "preview.css")
         self.gui_css_file = os.path.join(self.user_css_dir, "gui.css")
         self.print_css_file = os.path.join(self.user_css_dir, "print.css")
-        self.preview_template = "preview.tpl"
-        self.gui_template = "gui.tpl"
-        self.print_template = "print.tpl"
+        # paths look inside the 'templates' folder
+        self.preview_template = os.path.join("templates", "preview.tpl")
+        self.gui_template = os.path.join("templates", "gui.tpl")
+        self.print_template = os.path.join("templates", "print.tpl")
         self.front_matter_template = self.get_default_front_matter()
         self.ensure_css_structure()
     
@@ -90,7 +92,7 @@ class ConfigManager:
                 current_time = time.time()
                 
                 # If file is older than template, refresh it
-                template_path = os.path.join(os.path.dirname(__file__), 'print.tpl')
+                template_path = os.path.join(os.path.dirname(__file__), 'templates', 'print.tpl')
                 if os.path.exists(template_path):
                     template_mod_time = os.path.getmtime(template_path)
                     if template_mod_time > mod_time:
@@ -104,11 +106,12 @@ class ConfigManager:
                 with open(self.print_css_file, 'r', encoding='utf-8') as f:
                     content = f.read().strip()
                     if content and len(content) > 10:
-                        print(f"Loaded print CSS from user file: {len(content)} chars")
                         return content
+                    else:
+                        print(f"WARNING: Loaded print CSS from user file: {self.print_css_file} is {len(content)} chars")
             
             # Fallback to template file in same directory as config.py
-            template_path = os.path.join(os.path.dirname(__file__), 'print.tpl')
+            template_path = os.path.join(os.path.dirname(__file__), 'templates', 'print.tpl')
             if os.path.exists(template_path):
                 with open(template_path, 'r', encoding='utf-8') as f:
                     content = f.read()

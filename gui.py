@@ -2,29 +2,139 @@
 
 import os
 import platform
+import sys
+import time
 from PyQt5.QtWidgets import (
     QMainWindow, QTreeWidget, QTreeWidgetItem, QSplitter, QWidget,
     QVBoxLayout, QPlainTextEdit, QMessageBox, QTabWidget, QPushButton, 
-    QInputDialog, QMessageBox, QShortcut, QMenu
+    QInputDialog, QShortcut, QMenu, QHBoxLayout, QLineEdit, QCheckBox,
+    QLabel, QStyle
 )
 
-from PyQt5.QtWebEngineWidgets import QWebEngineView
-from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QFont, QKeySequence, QDrag
-from PyQt5.QtCore import QMimeData
+from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread, QMimeData, QByteArray, QSize
+from PyQt5.QtGui import (QFont, QKeySequence, QDrag, QTextDocument,
+                         QTextCursor, QIcon, QPixmap, QPainter)
+from PyQt5.QtSvg import QSvgRenderer
+
 from PyQt5.QtPrintSupport import QPrintDialog, QPrinter
-from PyQt5.QtWebEngineWidgets import QWebEngineView
-from PyQt5.QtWidgets import QHBoxLayout, QInputDialog
 
 from clipboard_handler import ClipboardImageHandler
-
+from assets import (SVG_ICON_CASE, SVG_ICON_SEARCH, SVG_ICON_CLEAR,
+                    ICON_BUTTON_STYLE)
 import file_manager
 import render
 
+def create_icon_from_svg(svg_data: str) -> QIcon:
+    """Creates a QIcon from raw SVG data."""
+    try:
+        svg_bytes = QByteArray(svg_data.encode('utf-8'))
+        renderer = QSvgRenderer(svg_bytes)
+        pixmap = QPixmap(renderer.defaultSize())
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        renderer.render(painter)
+        painter.end()
+        return QIcon(pixmap)
+    except Exception as e:
+        print(f"Error creating SVG icon: {e}")
+        return QIcon()
+
+class SearchWorker(QObject):
+    """
+    Worker thread for performing file search without freezing the GUI.
+    """
+    # Signal with a list of matching file paths
+    results_ready = pyqtSignal(list)
+    finished = pyqtSignal()
+
+    def __init__(self, root_path, search_term, case_sensitive=False):
+        super().__init__()
+        self.root_path = root_path
+        # Store the search term, lowercasing it only if the search is insensitive.
+        self.search_term = search_term if case_sensitive else search_term.lower()
+        self.case_sensitive = case_sensitive
+        self.is_running = True
+
+    def run(self):
+        """
+        Walks the directory tree and searches file names and contents.
+        """
+        matching_files = set()
+        try:
+            for root, _, files in os.walk(self.root_path):
+                if not self.is_running:
+                    break
+                for filename in files:
+                    if not self.is_running:
+                        break
+                    
+                    file_path = os.path.join(root, filename)
+                    
+                    # Prepare filename for comparison based on case sensitivity.
+                    search_in_filename = filename if self.case_sensitive else filename.lower()
+                    if self.search_term in search_in_filename:
+                        matching_files.add(file_path)
+                        continue  # Already matched, no need to check content
+
+                    # Search in content for .md files
+                    if filename.endswith(".md"):
+                        try:
+                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                content = f.read()
+                                # Prepare content for comparison based on case sensitivity.
+                                search_in_content = content if self.case_sensitive else content.lower()
+                                if self.search_term in search_in_content:
+                                    matching_files.add(file_path)
+                        except (IOError, OSError):
+                            # Ignore files we can't read
+                            continue
+        except Exception as e:
+            print(f"Error during search: {e}")
+        finally:
+            if self.is_running:
+                self.results_ready.emit(sorted(list(matching_files)))
+            self.finished.emit()
+
+    def stop(self):
+        self.is_running = False
+
+class SearchWidget(QWidget):
+    """A widget for text search functionality."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setupUi()
+        self.hide()
+
+    def setupUi(self):
+        """Initializes the UI components of the search widget."""
+        layout = QHBoxLayout()
+        layout.setContentsMargins(5, 5, 5, 5)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Find...")
+        layout.addWidget(self.search_input)
+
+        self.prev_btn = QPushButton("Previous")
+        layout.addWidget(self.prev_btn)
+
+        self.next_btn = QPushButton("Next")
+        layout.addWidget(self.next_btn)
+
+        self.case_checkbox = QCheckBox("Match Case")
+        layout.addWidget(self.case_checkbox)
+        
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.hide)
+        layout.addWidget(close_btn)
+        
+        self.setLayout(layout)
+
 class MarkdownManagerApp(QMainWindow):
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Markdown Note Taker - v17")
+        self.setWindowTitle("Markdown Manager")
 
         # Initialize config manager
         from config import ConfigManager
@@ -33,8 +143,15 @@ class MarkdownManagerApp(QMainWindow):
         # Initialize clipboard handler
         self.clipboard_handler = ClipboardImageHandler()
 
-        # Track unsaved changes
+        # Track unsaved changes and filter state
         self.has_unsaved_changes = False
+        self.is_filtered = False
+        self.search_thread = None
+        self.search_worker = None
+        self.root_path = "."  # Default root path
+
+        # Create menu bar
+        self._create_menu_bar()
 
         splitter = QSplitter(Qt.Horizontal)
         self.setCentralWidget(splitter)
@@ -44,135 +161,67 @@ class MarkdownManagerApp(QMainWindow):
         left_layout = QVBoxLayout()
         left_panel.setLayout(left_layout)
 
+        # Setup the new filter widget with buttons
+        self._setup_filter_widget(left_layout)
+
+        self.save_button = QPushButton()
+        self.save_button.clicked.connect(self.save_current_file)
+        left_layout.addWidget(self.save_button)
+
         self.tree = MarkdownTreeWidget(self)
         self.tree.setHeaderHidden(True)
         left_layout.addWidget(self.tree)
 
         # Connect the custom signal to refresh tree
-        self.tree.tree_updated.connect(lambda: self.load_tree("."))
+        self.tree.tree_updated.connect(lambda: self.load_tree(self.root_path))
 
         # Add context menu to tree
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.show_context_menu)
 
-        # Save button - Full width at bottom of left panel
-        self.save_file_btn = QPushButton("Save File (Ctrl+S)")
-        self.save_file_btn.clicked.connect(self.save_current_file)
-        self.update_save_button_style()
-        left_layout.addWidget(self.save_file_btn)
-
-        # Refresh Tree button and Print button - Same row
-        refresh_print_row = QWidget()
-        refresh_print_layout = QHBoxLayout()
-        refresh_print_row.setLayout(refresh_print_layout)
-
-        self.refresh_tree_btn = QPushButton("Refresh Tree")
-        self.refresh_tree_btn.clicked.connect(self.refresh_tree_preserve_state)
-        self.refresh_tree_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2c3e50;
-                color: #f0f0f0;
-                border: 1px solid #333;
-                padding: 8px 12px;
-                border-radius: 3px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #34495e;
-            }
-            QPushButton:pressed {
-                background-color: #1a252f;
-            }
-        """)
-        refresh_print_layout.addWidget(self.refresh_tree_btn)
-
-        self.print_btn = QPushButton("Print Preview")
-        self.print_btn.clicked.connect(self.print_preview)
-        self.print_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #27ae60;
-                color: #f0f0f0;
-                border: 1px solid #333;
-                padding: 8px 12px;
-                border-radius: 3px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #2ecc71;
-            }
-            QPushButton:pressed {
-                background-color: #229954;
-            }
-        """)
-        refresh_print_layout.addWidget(self.print_btn)
-
-        left_layout.addWidget(refresh_print_row)
-
-        # Add special function buttons at bottom
-        special_button_row = QWidget()
-        special_layout = QHBoxLayout()
-        special_button_row.setLayout(special_layout)
-        
-        front_matter_btn = QPushButton("Add Front Matter")
-        front_matter_btn.clicked.connect(self.add_front_matter)
-        special_layout.addWidget(front_matter_btn)
-        
-        default_style_btn = QPushButton("Reset Style")
-        default_style_btn.clicked.connect(self.reset_default_style)
-        special_layout.addWidget(default_style_btn)
-        
-        left_layout.addWidget(special_button_row)
-
-        # Add image paste button row
-        image_button_row = QWidget()
-        image_layout = QHBoxLayout()
-        image_button_row.setLayout(image_layout)
-        
-        paste_image_btn = QPushButton("Paste Image (Ctrl+Shift+V)")
-        paste_image_btn.clicked.connect(self.paste_image_from_clipboard)
-        paste_image_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #8e44ad;
-                color: #f0f0f0;
-                border: 1px solid #333;
-                padding: 8px 12px;
-                border-radius: 3px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #9b59b6;
-            }
-            QPushButton:pressed {
-                background-color: #7d3c98;
-            }
-        """)
-        image_layout.addWidget(paste_image_btn)
-        
-        left_layout.addWidget(image_button_row)
-
-        # Keybinds
-        # Keyboard shortcut for save
-        save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
-        save_shortcut.activated.connect(self.save_current_file)
-
-        # F2 for renaming selected file or folder
+        # Keybinds for actions not in the main menu
         rename_shortcut = QShortcut(QKeySequence(Qt.Key_F2), self)
         rename_shortcut.activated.connect(self.handle_rename_shortcut)
 
-        # Ctrl+N for creating new file in current directory
-        new_file_shortcut = QShortcut(QKeySequence("Ctrl+N"), self)
-        new_file_shortcut.activated.connect(self.handle_new_file_shortcut)
-
-        # Ctrl+Shift+V for pasting images from clipboard
-        paste_image_shortcut = QShortcut(QKeySequence("Ctrl+Shift+V"), self)
-        paste_image_shortcut.activated.connect(self.paste_image_from_clipboard)
+        search_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        search_shortcut.activated.connect(self.toggle_search_widget)
 
         splitter.addWidget(left_panel)
-        self.load_tree(".")
+        
+        # Determine and set up the default directory
+        try:
+            # Get the directory where the application script is located
+            script_dir = os.path.dirname(
+                os.path.abspath(sys.modules['__main__'].__file__)
+            )
+            self.project_root = script_dir 
+            docs_path = os.path.join(script_dir, "docs")
+            
+            # Create the 'docs' directory if it doesn't exist
+            os.makedirs(docs_path, exist_ok=True)
+            self.root_path = docs_path
 
-        # Right panel - Tab widget
+        except Exception as e:
+            # Fallback to current working directory if path detection fails
+            print(f"Error setting up default directory: {e}")
+            self.project_root = os.getcwd() 
+            self.root_path = "."
+        
+        self.load_tree(self.root_path)
+
+        # Right panel - Tab widget and Search
+        right_panel = QWidget()
+        right_layout = QVBoxLayout()
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_panel.setLayout(right_layout)
+
         self.tab_widget = QTabWidget()
-        splitter.addWidget(self.tab_widget)
+        right_layout.addWidget(self.tab_widget)
+        
+        self.search_widget = SearchWidget(self)
+        right_layout.addWidget(self.search_widget)
+        
+        splitter.addWidget(right_panel)
 
         # Editor tab
         self.editor = QPlainTextEdit()
@@ -197,7 +246,6 @@ class MarkdownManagerApp(QMainWindow):
         self.style_editor.setFont(style_font)
         self.style_editor.setStyleSheet("font-family: 'Courier New', monospace;")
         
-        # Load initial style configuration
         config_content = self.config_manager.load_config()
         self.style_editor.setPlainText(config_content)
         
@@ -211,14 +259,170 @@ class MarkdownManagerApp(QMainWindow):
         self.style_editor.textChanged.connect(self.update_rendered_view)
         self.tab_widget.currentChanged.connect(self.handle_tab_change)
 
-        # Set proportional sizes: 25% for left panel, 75% for right panel
+        # Connect search signals
+        self.search_widget.next_btn.clicked.connect(self.find_next)
+        self.search_widget.prev_btn.clicked.connect(self.find_previous)
+        self.search_widget.search_input.returnPressed.connect(self.find_next)
+        self.search_widget.search_input.textChanged.connect(
+            self.handle_search_text_changed
+        )
+
         splitter.setSizes([250, 750])
         
-        # Enable collapsible splitter with minimum sizes to prevent complete collapse
         splitter.setChildrenCollapsible(True)
         left_panel.setMinimumSize(150, 0)
-        self.tab_widget.setMinimumSize(300, 0)
+        right_panel.setMinimumSize(300, 0)
 
+        self.update_save_button_style()
+
+    def _setup_filter_widget(self, parent_layout):
+        """Creates and configures the file filter input and buttons."""
+        filter_layout = QHBoxLayout()
+        filter_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.filter_input = QLineEdit()
+        self.filter_input.setPlaceholderText("Filter files and content...")
+        self.filter_input.returnPressed.connect(self._start_search)
+        filter_layout.addWidget(self.filter_input)
+
+        # Case sensitive search button
+        self.case_sensitive_button = QPushButton()
+        self.case_sensitive_button.setIcon(create_icon_from_svg(SVG_ICON_CASE))
+        self.case_sensitive_button.setIconSize(QSize(20, 20))
+        self.case_sensitive_button.setCheckable(True)
+        self.case_sensitive_button.setFixedSize(28, 28)
+        self.case_sensitive_button.setToolTip("Match Case")
+        self.case_sensitive_button.setStyleSheet(ICON_BUTTON_STYLE)
+        filter_layout.addWidget(self.case_sensitive_button)
+
+        # Find button
+        self.find_button = QPushButton()
+        self.find_button.setIcon(create_icon_from_svg(SVG_ICON_SEARCH))
+        self.find_button.setIconSize(QSize(20, 20))
+        self.find_button.setFixedSize(28, 28)
+        self.find_button.setToolTip("Find")
+        self.find_button.clicked.connect(self._start_search)
+        self.find_button.setStyleSheet(ICON_BUTTON_STYLE)
+        filter_layout.addWidget(self.find_button)
+
+        # Clear button
+        self.clear_button = QPushButton()
+        self.clear_button.setIcon(create_icon_from_svg(SVG_ICON_CLEAR))
+        self.clear_button.setIconSize(QSize(20, 20))
+        self.clear_button.setFixedSize(28, 28)
+        self.clear_button.setToolTip("Clear filter and show all files")
+        self.clear_button.clicked.connect(self._clear_filter)
+        self.clear_button.setStyleSheet(ICON_BUTTON_STYLE)
+        filter_layout.addWidget(self.clear_button)
+        
+        parent_layout.addLayout(filter_layout)
+
+    def _start_search(self):
+        """Initiates the file search in a background thread."""
+        search_term = self.filter_input.text()  # Removed .strip()
+        if not search_term:
+            self._clear_filter()
+            return
+
+        # Stop previous search if it's still running
+        if self.search_thread and self.search_thread.isRunning():
+            self.search_worker.stop()
+            self.search_thread.quit()
+            self.search_thread.wait()
+
+        self.filter_input.setEnabled(False)
+        self.find_button.setEnabled(False)
+        self.case_sensitive_button.setEnabled(False)
+        self.clear_button.setEnabled(False)
+        self.tree.clear()
+        loading_item = QTreeWidgetItem(["Searching..."])
+        self.tree.addTopLevelItem(loading_item)
+
+        # Check case sensitivity state
+        is_case_sensitive = self.case_sensitive_button.isChecked()
+
+        # Setup and start the new search thread
+        self.search_thread = QThread()
+        self.search_worker = SearchWorker(
+            self.root_path, search_term, case_sensitive=is_case_sensitive
+        )
+        self.search_worker.moveToThread(self.search_thread)
+
+        self.search_thread.started.connect(self.search_worker.run)
+        self.search_worker.results_ready.connect(self._update_tree_with_filter)
+        self.search_worker.finished.connect(self.search_thread.quit)
+        self.search_worker.finished.connect(self.search_worker.deleteLater)
+        self.search_thread.finished.connect(self._on_search_complete)
+
+        self.search_thread.start()
+
+    def _update_tree_with_filter(self, matching_files):
+        """Rebuilds the tree view to show only the search results."""
+        self.tree.clear()
+        self.is_filtered = True
+        
+        if not matching_files:
+            no_results_item = QTreeWidgetItem(["No matches found."])
+            self.tree.addTopLevelItem(no_results_item)
+            return
+
+        # A dictionary to keep track of created tree items by their path
+        nodes = {}
+        root_path_abs = os.path.abspath(self.root_path)
+
+        for path in matching_files:
+            # Make path relative to the root for tree building
+            relative_path = os.path.relpath(path, os.path.dirname(root_path_abs))
+            
+            # Split path into parts (docs, folder, file.md)
+            path_parts = relative_path.split(os.sep)
+            
+            parent_item = None
+            current_path_so_far = os.path.dirname(root_path_abs)
+
+            for i, part in enumerate(path_parts):
+                current_path_so_far = os.path.join(current_path_so_far, part)
+                
+                if current_path_so_far in nodes:
+                    parent_item = nodes[current_path_so_far]
+                    continue
+
+                # Create new item
+                is_dir = (i < len(path_parts) - 1) or os.path.isdir(path)
+                display_name = f"📁 {part}" if is_dir else f"📄 {part}"
+                new_item = QTreeWidgetItem([display_name])
+                new_item.setData(0, Qt.UserRole, current_path_so_far)
+                nodes[current_path_so_far] = new_item
+                
+                if parent_item:
+                    parent_item.addChild(new_item)
+                else:
+                    self.tree.addTopLevelItem(new_item)
+                
+                parent_item = new_item
+        
+        # Expand all items in the filtered view for clarity
+        self.tree.expandAll()
+
+    def _clear_filter(self):
+        """Resets the filter and reloads the full directory tree."""
+        if self.search_thread and self.search_thread.isRunning():
+            self.search_worker.stop()
+            self.search_thread.quit()
+            self.search_thread.wait()
+
+        self.filter_input.clear()
+        self.is_filtered = False
+        self.load_tree(self.root_path)
+
+    def _on_search_complete(self):
+        """Re-enables UI elements after a search is complete."""
+        self.filter_input.setEnabled(True)
+        self.find_button.setEnabled(True)
+        self.case_sensitive_button.setEnabled(True)
+        self.clear_button.setEnabled(True)
+
+    # Events
     def handle_paste_event(self):
         """Handle paste event for images and text"""
         try:
@@ -461,50 +665,11 @@ class MarkdownManagerApp(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to rename {item_type}:\n{str(e)}")
 
     def on_editor_text_changed(self):
-            current_content = self.editor.toPlainText()
-            self.has_unsaved_changes = (current_content != self.original_content)
-            self.update_save_button_style()
-            self.update_rendered_view()
-
-    def update_save_button_style(self):
-            if self.has_unsaved_changes:
-                self.save_file_btn.setStyleSheet("""
-                    QPushButton {
-                        background-color: #ff8c00;
-                        border: 1px solid #333;
-                        padding: 8px 12px;
-                        border-radius: 3px;
-                        font-weight: bold;
-                    }
-                    QPushButton:hover {
-                        background-color: #ffa500;
-                    }
-                    QPushButton:pressed {
-                        background-color: #ff7700;
-                    }
-                """)
-            else:
-                self.save_file_btn.setStyleSheet("""
-                    QPushButton {
-                        background-color: #90EE90;
-                        color: #000000;
-                        border: 1px solid #333;
-                        padding: 8px 12px;
-                        border-radius: 3px;
-                        font-weight: bold;
-                    }
-                    QPushButton:hover {
-                        background-color: #98FB98;
-                    }
-                    QPushButton:pressed {
-                        background-color: #87CEEB;
-                    }
-                """)
-
-    def reset_refresh_button(self):
-        """Reset the refresh button to its normal state"""
-        self.refresh_tree_btn.setText("Refresh Tree")
-        self.refresh_tree_btn.setEnabled(True)
+        current_content = self.editor.toPlainText()
+        self.has_unsaved_changes = (current_content != self.original_content)
+        self.update_window_title()
+        self.update_rendered_view()
+        self.update_save_button_style()
 
     def print_preview(self):
         """Generate HTML and open in default browser for printing"""
@@ -538,16 +703,15 @@ class MarkdownManagerApp(QMainWindow):
                 return
             
             try:
-                # Get print CSS from config manager
                 print_css = self.config_manager.load_print_css()
-                
-                # Generate HTML with print CSS
                 import render
-                html_content = render.markdown_to_html_for_browser_print(md_text, print_css, self.current_file)
                 
-                # Create HTML file in same directory as the markdown file
+                # Pass project_root to the renderer
+                html_content = render.markdown_to_html_for_browser_print(md_text, print_css, self.current_file, project_root=self.project_root)
+                
                 file_dir = os.path.dirname(os.path.abspath(self.current_file))
                 filename_base = os.path.splitext(os.path.basename(self.current_file))[0]
+
                 html_filename = f"{filename_base}_print.html"
                 html_filepath = os.path.join(file_dir, html_filename)
                 
@@ -587,125 +751,121 @@ class MarkdownManagerApp(QMainWindow):
     def paste_image_from_clipboard(self):
         """Handle pasting image from clipboard into markdown"""
         try:
-            # Check if we have a file open
             if not self.current_file:
-                QMessageBox.warning(
-                    self, 
-                    "No File Open", 
-                    "Please open a markdown file before pasting an image."
-                )
+                QMessageBox.warning(self, "No File Open", "Please open a markdown file before pasting an image.")
                 return
             
-            # Check if clipboard has an image
             if not self.clipboard_handler.has_image_in_clipboard():
-                QMessageBox.information(
-                    self, 
-                    "No Image", 
-                    "No image found in clipboard.\nCopy an image first, then use Ctrl+Shift+V to paste."
-                )
+                QMessageBox.information(self, "No Image", "No image found in clipboard.")
                 return
             
-            # Set the base directory to the application root (where app.py is)
-            #app_root_dir = os.path.abspath(os.path.dirname(__file__))
-            #self.clipboard_handler.base_dir = app_root_dir
             self.clipboard_handler.ensure_images_folder()
-            app_root_dir = self.clipboard_handler.base_dir  # added 
-            
-            # Process the clipboard image
             result = self.clipboard_handler.process_clipboard_image()
             
             if result:
-                relative_path, absolute_path = result
+                relative_path_from_root, absolute_path = result
                 
-                # Ask user for alt text
-                alt_text, ok = QInputDialog.getText(
-                    self, 
-                    "Image Description", 
-                    "Enter alt text for the image (optional):",
-                    text="Pasted Image"
-                )
-                
+                alt_text, ok = QInputDialog.getText(self, "Image Description", "Enter alt text for the image (optional):", text="Pasted Image")
                 if not ok:
                     alt_text = "Pasted Image"
                 
-                # Calculate relative path from current markdown file to root images folder
-                current_file_dir = os.path.dirname(os.path.abspath(self.current_file))
-                
-                # Get relative path from current file to app root
-                try:
-                    rel_path_to_root = os.path.relpath(app_root_dir, current_file_dir)
+                # Create a clean, root-relative path for portability (e.g., for Hugo)
+                markdown_image_path = f"/{relative_path_from_root.replace(os.sep, '/')}"
 
-                    # Normalize path separators for markdown
-                    rel_path_to_root = rel_path_to_root.replace(os.sep, '/')
-                    
-                    # Build the markdown image path
-                    '''
-                    if rel_path_to_root == '.':
-                        # Same directory as app root
-                        markdown_image_path = relative_path
-                    else:
-                        # Need to navigate to root first
-                        markdown_image_path = f"{rel_path_to_root}/{relative_path}"
-                        # Clean up any redundant slashes or dots
-                        markdown_image_path = markdown_image_path.replace('//', '/')
-                    '''
-                    markdown_image_path = f"/{relative_path}".replace('//', '/')
-                except ValueError:
-                    # Different drives on Windows, use absolute path from root
-                    markdown_image_path = f"/{relative_path}"
+                markdown_link = self.clipboard_handler.create_markdown_image_link(alt_text, markdown_image_path)
                 
-                # Create markdown link
-                markdown_link = self.clipboard_handler.create_markdown_image_link(
-                    alt_text, 
-                    markdown_image_path
-                )
-                
-                # Insert into editor at cursor position
                 cursor = self.editor.textCursor()
                 
-                # Add newlines if needed
-                current_text = self.editor.toPlainText()
-                cursor_pos = cursor.position()
-                
-                # Check if we need newlines before
-                if cursor_pos > 0 and current_text[cursor_pos - 1] != '\n':
+                if not cursor.atBlockStart():
                     markdown_link = '\n' + markdown_link
-                
-                # Check if we need newlines after
-                if cursor_pos < len(current_text) and current_text[cursor_pos] != '\n':
+                if not cursor.atBlockEnd():
                     markdown_link = markdown_link + '\n'
                 
-                # Insert the markdown
                 cursor.insertText(markdown_link)
-                
-                # Update the preview
                 self.update_rendered_view()
                 
-                # Show success message
-                filename = os.path.basename(absolute_path)
-                QMessageBox.information(
-                    self, 
-                    "Image Pasted", 
-                    f"Image saved as: {filename}\nLocation: images/{filename}\nMarkdown path: {markdown_image_path}"
-                )
-                
-                # Mark as having unsaved changes
-                self.has_unsaved_changes = True
-                self.update_save_button_style()
-                
+                QMessageBox.information(self, "Image Pasted", f"Image saved to: {relative_path_from_root}")
             else:
-                QMessageBox.critical(
-                    self, 
-                    "Paste Failed", 
-                    "Failed to save the image from clipboard.\nPlease try again."
-                )
-                
+                QMessageBox.critical(self, "Paste Failed", "Failed to save the image from clipboard.")
         except Exception as e:
-            QMessageBox.critical(
-                self, 
-                "Error", 
-                f"An error occurred while pasting the image:\n{str(e)}"
-            )
+            QMessageBox.critical(self, "Error", f"An error occurred while pasting the image:\n{str(e)}")
+
+    # Search Widget
+    def toggle_search_widget(self):
+        """Shows or hides the search widget and focuses the input field."""
+        if self.search_widget.isVisible():
+            self.search_widget.hide()
+        else:
+            self.search_widget.show()
+            self.search_widget.search_input.setFocus()
+            self.search_widget.search_input.selectAll()
+
+    def _get_search_flags(self):
+        """Gets search flags based on UI controls for editor and web view."""
+        editor_flags = QTextDocument.FindFlags()
+        web_flags = QWebEnginePage.FindFlags()
+
+        if self.search_widget.case_checkbox.isChecked():
+            editor_flags |= QTextDocument.FindCaseSensitively
+            web_flags |= QWebEnginePage.FindCaseSensitively
+        
+        return editor_flags, web_flags
+
+    def find_next(self):
+        """Finds the next occurrence of the search text."""
+        self._find_text(find_next=True)
+
+    def find_previous(self):
+        """Finds the previous occurrence of the search text."""
+        self._find_text(find_next=False)
+
+    def _find_text(self, find_next=True):
+        """
+        Core search logic for both editor and preview tabs.
+        It wraps around the document when the end or beginning is reached.
+        """
+        search_text = self.search_widget.search_input.text()
+        if not search_text:
+            return
+
+        current_tab_index = self.tab_widget.currentIndex()
+        editor_flags, web_flags = self._get_search_flags()
+
+        if not find_next:
+            editor_flags |= QTextDocument.FindBackward
+            web_flags |= QWebEnginePage.FindBackward
+
+        # Search in Editor (Tab 0)
+        if current_tab_index == 0:
+            found = self.editor.find(search_text, editor_flags)
+            if not found:
+                # Wrap search
+                cursor = self.editor.textCursor()
+                if find_next:
+                    cursor.movePosition(QTextCursor.Start)
+                else:
+                    cursor.movePosition(QTextCursor.End)
+                self.editor.setTextCursor(cursor)
+                self.editor.find(search_text, editor_flags)
+        
+        # Search in Preview (Tab 1)
+        elif current_tab_index == 1:
+            self.render_html.findText(search_text, web_flags)
+        
+        # Other tabs (like Style) are not searchable with this feature.
+
+    def handle_search_text_changed(self, text):
+        """Clears search highlights if the search text is empty."""
+        if not text:
+            current_tab_index = self.tab_widget.currentIndex()
+            if current_tab_index == 0:
+                # Clear selection in editor
+                cursor = self.editor.textCursor()
+                cursor.clearSelection()
+                self.editor.setTextCursor(cursor)
+            elif current_tab_index == 1:
+                # Clear highlights in preview
+                self.render_html.findText("")
 
     # Context aware stuff
     def show_context_menu(self, position):
@@ -961,17 +1121,14 @@ class MarkdownManagerApp(QMainWindow):
         """Load a file by its path"""
         if os.path.isfile(file_path) and file_path.endswith(".md"):
             try:
+                self.editor.setReadOnly(False)
                 content = file_manager.load_file(file_path)
                 self.editor.setPlainText(content)
                 self.current_file = file_path
                 self.original_content = content
                 self.has_unsaved_changes = False
-                self.update_save_button_style()
+                self.update_window_title()
                 self.update_rendered_view()
-                
-                # Update window title
-                filename = os.path.basename(file_path)
-                self.setWindowTitle(f"Markdown Manager - {filename}")
                 
                 # Select the file in the tree
                 file_item = self.tree.find_item_by_path(file_path)
@@ -980,12 +1137,13 @@ class MarkdownManagerApp(QMainWindow):
                     self.tree.scrollToItem(file_item)
                     
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to load file:\n{str(e)}")
+                QMessageBox.critical(
+                    self, "Error", f"Failed to load file:\n{str(e)}"
+                )
 
     # CRUD
     def save_current_file(self):
         """Save the current file or style configuration"""
-        # Check which tab is active
         current_tab_index = self.tab_widget.currentIndex()
         
         if current_tab_index == 2:  # Style tab
@@ -1001,10 +1159,13 @@ class MarkdownManagerApp(QMainWindow):
             file_manager.save_file(self.current_file, content)
             self.original_content = content
             self.has_unsaved_changes = False
+            self.update_window_title()
+            # This line tells the button to update after a successful save
             self.update_save_button_style()
-            QMessageBox.information(self, "Saved", f"File saved:\n{self.current_file}")
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to save file:\n{str(e)}")
+            QMessageBox.critical(
+                self, "Error", f"Failed to save file:\n{str(e)}"
+            )
 
     def create_new_folder(self):
         selected_item = self.tree.currentItem()
@@ -1120,34 +1281,48 @@ class MarkdownManagerApp(QMainWindow):
             QMessageBox.warning(self, "Error", "Selected item does not exist.")
             return
 
-        # Check if it's a valid item to delete (.md file or directory)
         is_directory = os.path.isdir(path)
         is_md_file = os.path.isfile(path) and path.endswith(".md")
         
         if not is_directory and not is_md_file:
-            QMessageBox.warning(self, "Error", "Only .md files and folders can be deleted.")
+            QMessageBox.warning(
+                self, "Error", "Only .md files and folders can be deleted."
+            )
             return
 
         item_type = "folder" if is_directory else "file"
         
-        # Show different confirmation messages for files vs folders
         if is_directory:
-            # Count contents for folder deletion warning
             try:
                 contents = os.listdir(path)
-                file_count = len([f for f in contents if os.path.isfile(os.path.join(path, f))])
-                folder_count = len([f for f in contents if os.path.isdir(os.path.join(path, f))])
+                file_count = len(
+                    [f for f in contents 
+                     if os.path.isfile(os.path.join(path, f))]
+                )
+                folder_count = len(
+                    [f for f in contents 
+                     if os.path.isdir(os.path.join(path, f))]
+                )
                 
-                if contents:
-                    content_msg = f"\nThis folder contains {file_count} file(s) and {folder_count} subfolder(s)."
-                else:
-                    content_msg = "\nThis folder is empty."
+                content_msg = (
+                    f"\nThis folder contains {file_count} file(s) and "
+                    f"{folder_count} subfolder(s)."
+                ) if contents else "\nThis folder is empty."
                     
-                confirm_msg = f"Are you sure you want to delete the folder:\n{path}?{content_msg}\n\nThis action cannot be undone."
+                confirm_msg = (
+                    f"Are you sure you want to delete the folder:\n{path}?"
+                    f"{content_msg}\n\nThis action cannot be undone."
+                )
             except (PermissionError, OSError):
-                confirm_msg = f"Are you sure you want to delete the folder:\n{path}?\n\nThis action cannot be undone."
+                confirm_msg = (
+                    f"Are you sure you want to delete the folder:\n{path}?"
+                    f"\n\nThis action cannot be undone."
+                )
         else:
-            confirm_msg = f"Are you sure you want to delete the file:\n{path}?\n\nThis action cannot be undone."
+            confirm_msg = (
+                f"Are you sure you want to delete the file:\n{path}?"
+                f"\n\nThis action cannot be undone."
+            )
 
         confirm = QMessageBox.question(
             self, f"Confirm Delete {item_type.title()}",
@@ -1157,67 +1332,60 @@ class MarkdownManagerApp(QMainWindow):
         
         if confirm == QMessageBox.Yes:
             try:
-                # Store expanded state and current selection for restoration
                 expanded_paths = self.tree.get_expanded_paths()
                 parent_dir = os.path.dirname(path)
                 
-                # Clear current file if it's being deleted
-                if self.current_file == path or (is_directory and self.current_file and self.current_file.startswith(path + os.sep)):
+                if self.current_file == path or (
+                    is_directory and self.current_file and 
+                    self.current_file.startswith(path + os.sep)
+                ):
                     self.current_file = None
                     self.editor.clear()
                     self.render_html.setHtml("")
                     self.original_content = ""
                     self.has_unsaved_changes = False
-                    self.update_save_button_style()
-                    self.setWindowTitle("Markdown Manager - PyQt")
+                    self.update_window_title()
                 
-                # Remove the item from tree immediately to provide instant feedback
                 parent_tree_item = selected_item.parent()
                 if parent_tree_item:
                     parent_tree_item.removeChild(selected_item)
                 else:
-                    # Top level item
                     index = self.tree.indexOfTopLevelItem(selected_item)
                     if index >= 0:
                         self.tree.takeTopLevelItem(index)
                 
-                # Perform the actual deletion
                 file_manager.delete_item(path)
                 
-                # Try selective refresh of parent directory
                 refresh_success = False
                 if os.path.isdir(parent_dir):
-                    refresh_success = self.tree.refresh_directory_node(parent_dir)
+                    refresh_success = self.tree.refresh_directory_node(
+                        parent_dir
+                    )
                     
-                    # Verify the refresh worked by checking if deleted item is still visible
                     if refresh_success:
                         deleted_item_check = self.tree.find_item_by_path(path)
                         if deleted_item_check is not None:
-                            # Item is still visible, refresh failed
                             refresh_success = False
-                            print(f"Selective refresh verification failed: deleted item still visible at {path}")
                 
                 if refresh_success:
-                    # Restore expanded state after successful selective refresh
                     self.tree.restore_expanded_state(expanded_paths)
-                    print(f"Selective refresh successful for {parent_dir}")
                 else:
-                    # Fallback to full tree reload
-                    print(f"Selective refresh failed for {parent_dir}, performing full tree reload")
                     self.load_tree(".")
                     
-                QMessageBox.information(self, "Success", f"{item_type.title()} deleted successfully.")
+                QMessageBox.information(
+                    self, "Success", f"{item_type.title()} deleted successfully."
+                )
                 
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to delete {item_type}:\n{str(e)}")
-                # On any error, do a full refresh to ensure tree is in correct state
+                QMessageBox.critical(
+                    self, "Error", f"Failed to delete {item_type}:\n{str(e)}"
+                )
                 self.load_tree(".")
 
     # TREE
     def refresh_tree_preserve_state(self):
-        """Refresh the entire tree while preserving expanded state and current selection"""
+        """Refresh tree while preserving expanded state and selection."""
         try:
-            # Store current state including all expanded paths
             expanded_paths = set()
             
             def collect_expanded(item):
@@ -1232,73 +1400,94 @@ class MarkdownManagerApp(QMainWindow):
             
             current_selection_path = None
             if self.tree.currentItem():
-                current_selection_path = self.get_full_path(self.tree.currentItem())
+                current_selection_path = self.get_full_path(
+                    self.tree.currentItem()
+                )
             
-            # Store scroll position
             scroll_bar = self.tree.verticalScrollBar()
             scroll_position = scroll_bar.value()
             
-            # Temporarily disable the button and change text to show activity
-            self.refresh_tree_btn.setText("Refreshing...")
-            self.refresh_tree_btn.setEnabled(False)
-            
-            # Force update UI to show the button state change
             from PyQt5.QtCore import QCoreApplication
             QCoreApplication.processEvents()
             
-            # Perform full tree reload
             self.load_tree(".")
             
-            # Process events to ensure tree is fully loaded
             QCoreApplication.processEvents()
             
-            # Restore expanded state for all paths that still exist
             for path in expanded_paths:
                 if os.path.exists(path):
                     item = self.tree.find_item_by_path(path)
                     if item:
-                        # Ensure parent items are expanded first
                         parent = item.parent()
                         parent_stack = []
                         while parent:
                             parent_stack.append(parent)
                             parent = parent.parent()
                         
-                        # Expand from root to child
                         while parent_stack:
                             parent = parent_stack.pop()
                             if not parent.isExpanded():
                                 parent.setExpanded(True)
-                                # Trigger lazy loading if needed
                                 self.on_item_expanded(parent)
                         
-                        # Finally expand the item itself
                         if not item.isExpanded():
                             item.setExpanded(True)
                             self.on_item_expanded(item)
             
-            # Restore selection if possible
-            if current_selection_path and os.path.exists(current_selection_path):
-                selection_item = self.tree.find_item_by_path(current_selection_path)
+            if current_selection_path and os.path.exists(
+                current_selection_path
+            ):
+                selection_item = self.tree.find_item_by_path(
+                    current_selection_path
+                )
                 if selection_item:
                     self.tree.setCurrentItem(selection_item)
                     self.tree.scrollToItem(selection_item)
                 else:
-                    # Try to restore scroll position if selection not found
                     scroll_bar.setValue(scroll_position)
             
-            # Show brief success feedback
-            self.refresh_tree_btn.setText("Refreshed!")
-            
-            # Use QTimer to reset button text after a short delay
-            from PyQt5.QtCore import QTimer
-            QTimer.singleShot(1000, lambda: self.reset_refresh_button())
-            
         except Exception as e:
-            QMessageBox.warning(self, "Refresh Error", f"Failed to refresh tree:\n{str(e)}")
-            self.reset_refresh_button()
+            QMessageBox.warning(
+                self, "Refresh Error", f"Failed to refresh tree:\n{str(e)}"
+            )
 
+    # Load Just the docs
     def load_tree(self, path):
+        """Loads the directory structure from the given path into the tree."""
+        self.tree.clear()
+        
+        try:
+            root_path = os.path.abspath(path)
+            if not os.path.isdir(root_path):
+                QMessageBox.critical(
+                    self, "Error", f"Base path is not a directory: {root_path}"
+                )
+                return
+
+            # Use the directory name as the root item in the tree
+            root_display_name = f"📁 {os.path.basename(root_path)}"
+            root_item = QTreeWidgetItem([root_display_name])
+            root_item.setData(0, Qt.UserRole, root_path)
+            self.tree.addTopLevelItem(root_item)
+            
+            # Populate the root item with its contents and expand it
+            self.add_lazy_children(root_item, root_path)
+            root_item.setExpanded(True)
+
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Error Loading Tree", f"Failed to load file tree: {e}"
+            )
+
+        # Connect itemExpanded signal for lazy loading
+        try:
+            self.tree.itemExpanded.disconnect()
+        except TypeError:
+            pass  # No connections to disconnect
+        self.tree.itemExpanded.connect(self.on_item_expanded)
+
+    # Load Full drive
+    def UNUSED_load_tree(self, path):
         self.tree.clear()
         
         if platform.system() == "Windows":
@@ -1467,40 +1656,42 @@ class MarkdownManagerApp(QMainWindow):
         try:
             path = self.get_full_path(item)
             
-            # Validate the path exists and is accessible
             if not path or not os.path.exists(path):
                 QMessageBox.warning(self, "Error", f"File not found: {path}")
                 return
             
             if not os.path.isfile(path):
-                # Not a file, ignore click
                 return
                 
             if not path.endswith(".md"):
-                QMessageBox.warning(self, "Error", "Only .md files can be opened in the editor.")
+                QMessageBox.warning(
+                    self, "Error", 
+                    "Only .md files can be opened in the editor."
+                )
                 return
             
-            # Attempt to load the file
+            self.editor.setReadOnly(False)
             content = file_manager.load_file(path)
             self.editor.setPlainText(content)
             self.current_file = path
             self.original_content = content
             self.has_unsaved_changes = False
-            self.update_save_button_style()
+            self.update_window_title()
             self.update_rendered_view()
-            
-            # Update window title to show current file
-            filename = os.path.basename(path)
-            self.setWindowTitle(f"Markdown Manager - {filename}")
+            # This line ensures the button resets to "Saved" on file load
+            self.update_save_button_style()
             
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load file:\n{str(e)}")
-            # Clear editor on error
+            QMessageBox.critical(
+                self, "Error", f"Failed to load file:\n{str(e)}"
+            )
             self.editor.clear()
             self.render_html.setHtml("")
             self.current_file = None
             self.original_content = ""
             self.has_unsaved_changes = False
+            self.update_window_title()
+            # Also update the button in case of an error
             self.update_save_button_style()
 
     def on_item_expanded(self, item):
@@ -1559,45 +1750,49 @@ class MarkdownManagerApp(QMainWindow):
         """Get the full path stored in the item's data"""
         return item.data(0, Qt.UserRole) or ""
 
+    def update_save_button_style(self):
+        """Updates the save button's text and color based on save state."""
+        if self.has_unsaved_changes:
+            self.save_button.setText("Save (Ctrl+S)")
+            # An orange color to indicate unsaved changes
+            self.save_button.setStyleSheet("background-color: #fd7e14; color: #ffffff;")
+        else:
+            self.save_button.setText("Saved")
+            # A green color to indicate the file is saved
+            self.save_button.setStyleSheet("background-color: #28a745; color: #ffffff;")
+
+    # Rendering?
     def update_rendered_view(self):
-        """Update the rendered HTML view with current content and styling"""
+        """Update the rendered HTML view with current content and styling."""
         md_text = self.editor.toPlainText()
+        
+        if md_text.strip().lower().startswith('<!doctype html'):
+            return
+
         custom_css = self.style_editor.toPlainText()
 
         try:
-            # Get the directory of the current file for relative path resolution
-            base_dir = None
-            if self.current_file:
-                base_dir = os.path.dirname(os.path.abspath(self.current_file))
-            else:
-                base_dir = os.path.abspath(".")
+            base_dir = os.path.dirname(os.path.abspath(self.current_file)) if self.current_file else os.path.abspath(".")
             
-            # Create temporary HTML file in the same directory as the markdown file
-            temp_html_path = render.markdown_to_html(md_text, custom_css, save_temp_file=True, base_dir=base_dir)
+            # Pass project_root to the renderer
+            temp_html_path = render.markdown_to_html(md_text, custom_css, save_temp_file=True, base_dir=base_dir, project_root=self.project_root)
             
-            if temp_html_path and temp_html_path.endswith('.html'):
-                # Load from file URL so relative paths work
+            if temp_html_path and os.path.exists(temp_html_path):
                 from PyQt5.QtCore import QUrl
                 file_url = QUrl.fromLocalFile(os.path.abspath(temp_html_path))
+                
+                query = f"v={int(time.time() * 1000)}"
+                file_url.setQuery(query)
+                
                 self.render_html.setUrl(file_url)
             else:
-                # Fallback to setHtml if temp file creation failed
-                self.render_html.setHtml(temp_html_path)
+                self.render_html.setHtml(temp_html_path or "")
                 
         except Exception as e:
-            error_html = f"""
-            <html>
-            <body style="font-family: Arial, sans-serif; background-color: #121212; color: #f0f0f0; padding: 20px;">
-                <div style="background-color: #2c1e1e; border: 1px solid #e74c3c; padding: 20px; border-radius: 5px;">
-                    <h3 style="color: #e74c3c; margin-top: 0;">Markdown Rendering Error</h3>
-                    <p>Error rendering markdown: {str(e)}</p>
-                    <p style="color: #bdc3c7; font-style: italic;">Please check your markdown syntax and try again.</p>
-                </div>
-            </body>
-            </html>
-            """
+            error_html = f"<html><body><h3>Markdown Rendering Error</h3><p>{str(e)}</p></body></html>"
             self.render_html.setHtml(error_html)
 
+    # Other
     def handle_tab_change(self, index):
         """Handle tab changes and update preview when needed"""
         # Store previous tab index if it exists
@@ -1628,7 +1823,7 @@ class MarkdownManagerApp(QMainWindow):
             return ["/"]
 
     def run(self):
-        self.show()
+        self.showMaximized()
 
     def add_front_matter(self):
         if not self.current_file:
@@ -1718,6 +1913,123 @@ class MarkdownManagerApp(QMainWindow):
             pass  # Ignore cleanup errors
         
         event.accept()
+
+    # Menu System
+    def _create_menu_bar(self):
+        """Create the main menu bar for the application."""
+        menu_bar = self.menuBar()
+
+        # File Menu
+        file_menu = menu_bar.addMenu("&File")
+
+        save_action = file_menu.addAction("Save")
+        save_action.setShortcut("Ctrl+S")
+        save_action.triggered.connect(self.save_current_file)
+
+        new_menu = file_menu.addMenu("New")
+        new_file_action = new_menu.addAction("New File")
+        new_file_action.setShortcut("Ctrl+N")
+        new_file_action.triggered.connect(self.handle_new_file_shortcut)
+
+        new_folder_action = new_menu.addAction("New Folder")
+        new_folder_action.triggered.connect(self.create_new_folder)
+
+        delete_action = file_menu.addAction("Delete")
+        delete_action.setShortcut("Delete")
+        delete_action.triggered.connect(self.delete_selected)
+
+        file_menu.addSeparator()
+
+        # add exit button here
+
+        # Document Menu
+        document_menu = menu_bar.addMenu("&Document")
+
+        front_matter_action = document_menu.addAction("Add Front Matter")
+        front_matter_action.triggered.connect(self.add_front_matter)
+
+        document_menu.addSeparator()
+
+        paste_image_action = document_menu.addAction("Paste Image")
+        paste_image_action.setShortcut("Ctrl+Shift+V")
+        paste_image_action.triggered.connect(self.paste_image_from_clipboard)
+
+        print_action = document_menu.addAction("Print Preview")
+        print_action.triggered.connect(self.print_preview)
+
+
+        # Utility Menu
+        utility_menu = menu_bar.addMenu("&Utility")
+
+        refresh_action = utility_menu.addAction("Refresh Tree")
+        refresh_action.setShortcut("F5")
+        refresh_action.triggered.connect(self.refresh_tree_preserve_state)
+
+        reset_style_action = utility_menu.addAction("Reset ALL Styles")
+        reset_style_action.triggered.connect(self.reset_default_style)
+
+        # Help Menu
+        help_menu = menu_bar.addMenu("&Help")
+
+        style_guide_action = help_menu.addAction("Styling Guide")
+        style_guide_action.triggered.connect(
+            lambda: self.open_help_file('docs/readme-css.md')
+        )
+
+        app_guide_action = help_menu.addAction("Application Guide")
+        app_guide_action.triggered.connect(
+            lambda: self.open_help_file('docs/readme.md')
+        )
+        
+        help_menu.addSeparator()
+
+        about_action = help_menu.addAction("About")
+        about_action.triggered.connect(self.show_about_dialog)
+
+    def open_help_file(self, file_path):
+        """Load and display a read-only help file."""
+        if not os.path.exists(file_path):
+            QMessageBox.warning(
+                self, "Help File Not Found", f"Could not find: {file_path}"
+            )
+            return
+
+        self.load_file_by_path(file_path)
+        if self.current_file == file_path:
+            self.editor.setReadOnly(True)
+            self.update_window_title()
+
+    def update_window_title(self):
+        """Update the main window title with file and save status."""
+        title = "Markdown Manager"
+        if self.current_file:
+            # Check if it's a help file
+            is_help_file = 'docs' in self.current_file.split(os.sep)
+            filename = os.path.basename(self.current_file)
+            status = " [Read-Only]" if is_help_file else ""
+            title = f"{filename}{status} - {title}"
+
+        if self.has_unsaved_changes:
+            title = f"*{title}"
+
+        self.setWindowTitle(title)
+
+    def show_about_dialog(self):
+        """Displays the application's About dialog."""
+        try:
+            version = self.config_manager.app_version
+        except AttributeError:
+            version = "Not Found"
+        
+        QMessageBox.about(
+            self,
+            "About Markdown Manager",
+            f"""<b>Markdown Manager</b>
+            <p>Version: {version}</p>
+            <p>A lightweight, cross-platform Markdown editor and file manager built with PyQt5.</p>
+            <p>For more information, see the Application Guide in the Help menu.</p>
+            """
+        )
 
 class MarkdownTreeWidget(QTreeWidget):
     # Signal to inform parent to refresh the tree

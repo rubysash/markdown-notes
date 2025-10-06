@@ -16,16 +16,9 @@ QHeaderView::section {
     background-color: #1f1f1f;
 }
 
-/* Styles the drop-down menu items (e.g., Save, New File) */
-QMenu::item:selected {
-    background-color: #007bff;
-    color: #ffffff;
-}
-
-/* Styles the top-level menu bar items (e.g., File, Utility) */
-QMenuBar::item:selected {
-    background-color: #007bff;
-    color: #ffffff;
+QTreeWidget::item:selected {
+    background-color: #333333;
+    color: #f0f0f0;
 }
 
 QTabBar::tab {

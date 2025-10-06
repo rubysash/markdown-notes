@@ -3,6 +3,319 @@
 import markdown
 import os
 import sys
+import re
+import uuid
+import html
+
+def _load_template(file_name):
+    """Loads a template file with error handling."""
+    try:
+        # Templates are expected to be in a 'templates' subdirectory
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        file_path = os.path.join(script_dir, "templates", file_name)
+        if os.path.exists(file_path):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        print(f"Warning: Template file not found at {file_path}")
+    except (IOError, OSError) as e:
+        print(f"Warning: Could not load template file {file_name}: {e}")
+    return ""  # Return empty string on failure
+
+def process_svg_and_images(html_content, base_dir=None, project_root=None):
+    """Process SVG elements and image paths, resolving root-relative links."""
+    import re
+    
+    def fix_svg_element(match):
+        """A simplified processor for inline SVGs."""
+        svg_content = match.group(0)
+        
+        if 'xmlns=' not in svg_content:
+            svg_content = svg_content.replace(
+                '<svg', '<svg xmlns="http://www.w3.org/2000/svg"', 1
+            )
+        
+        if 'style=' not in svg_content:
+            web_style = 'max-width: 100%; height: auto; display: block; margin: 1em auto;'
+            svg_content = svg_content.replace('<svg', f'<svg style="{web_style}"', 1)
+            
+        return svg_content
+
+    html_content = re.sub(
+        r'<svg[^>]*?>.*?</svg>', 
+        fix_svg_element, 
+        html_content, 
+        flags=re.DOTALL | re.IGNORECASE
+    )
+    
+    if base_dir and project_root:
+        def fix_image_path(match):
+            img_tag = match.group(0)
+            src_match = re.search(r'src="([^"]+)"', img_tag)
+            if not src_match: return img_tag
+            
+            original_src = src_match.group(1)
+            
+            if original_src.startswith(('http', 'data:', 'file:///')):
+                return img_tag
+            
+            absolute_path = None
+            if original_src.startswith('/'):
+                # It's a root-relative path, join with project_root
+                absolute_path = os.path.normpath(os.path.join(project_root, original_src[1:]))
+            else:
+                # It's a standard relative path, join with base_dir
+                absolute_path = os.path.normpath(os.path.join(base_dir, original_src))
+
+            if absolute_path and os.path.exists(absolute_path):
+                file_url = f"file:///{absolute_path.replace(os.sep, '/')}"
+                return img_tag.replace(f'src="{original_src}"', f'src="{file_url}"')
+            
+            return img_tag
+
+        html_content = re.sub(r'<img[^>]+src="[^"]+"', fix_image_path, html_content)
+    
+    return html_content
+
+def get_svg_support_css():
+    """Return CSS specifically for SVG support from a template file."""
+    return _load_template("svg_support.tpl")
+
+def markdown_to_html(md_text, custom_css=None, save_temp_file=False, base_dir=None, project_root=None):
+    """
+    Converts markdown to HTML, safely protecting and re-inserting SVG blocks.
+    """
+    css_manager = CSSManager()
+    
+    try:
+        # 1. Protect SVG by extracting it and leaving a unique text placeholder
+        placeholders = {}
+        def extract_svg_callback(match):
+            placeholder = f"svg-placeholder-{uuid.uuid4()}"
+            placeholders[placeholder] = match.group(0)
+            return placeholder
+        
+        md_text_clean = re.sub(
+            r'<svg.*?</svg>',
+            extract_svg_callback,
+            md_text,
+            flags=re.DOTALL | re.IGNORECASE
+        )
+
+        # 2. Configure and run the Markdown processor
+        extensions = [
+            'tables', 'fenced_code', 'sane_lists', 'codehilite',
+            'toc', 'extra', 'attr_list'
+        ]
+        extension_configs = {
+            'codehilite': {'css_class': 'highlight', 'use_pygments': True}
+        }
+        md = markdown.Markdown(
+            extensions=extensions,
+            extension_configs=extension_configs,
+            output_format='html5'
+        )
+        html_content = md.convert(md_text_clean)
+
+        # 3. Re-insert the original SVG content
+        for placeholder, svg_block in placeholders.items():
+            # The placeholder might be wrapped in <p> tags by the processor
+            p_placeholder = f"<p>{placeholder}</p>"
+            if p_placeholder in html_content:
+                html_content = html_content.replace(p_placeholder, svg_block)
+            else:
+                html_content = html_content.replace(placeholder, svg_block)
+
+        # 4. Post-process the final HTML to resolve image paths
+        html_content = process_svg_and_images(html_content, base_dir, project_root)
+
+        # 5. Assemble the full HTML page
+        preview_css = css_manager.get_preview_css(custom_css)
+        svg_css = get_svg_support_css()
+        html_full_page = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Markdown Preview</title>
+    <style>{preview_css}\n{svg_css}</style>
+</head>
+<body>{html_content}</body>
+</html>"""
+
+        # 6. Save to temp file for the viewer
+        if save_temp_file and base_dir:
+            temp_file_path = os.path.join(base_dir, '.markdown_preview_temp.html')
+            with open(temp_file_path, 'w', encoding='utf-8') as f:
+                f.write(html_full_page)
+            return temp_file_path
+        
+        return html_full_page
+
+    except Exception as e:
+        return _generate_error_html(f"Failed to render markdown: {str(e)}")
+
+def _generate_error_html(error_message):
+    """Generate a styled error HTML page"""
+    error_css = _load_template("error.tpl")
+    
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Markdown Error</title>
+    <style>{error_css}</style>
+</head>
+<body>
+    <div class="error-container">
+        <h2 class="error-title">Markdown Rendering Error</h2>
+        <div class="error-message">{html.escape(error_message)}</div>
+        <div class="error-suggestion">
+            Please check your markdown syntax and try again. 
+            If the problem persists, verify that all required Python packages are installed.
+        </div>
+    </div>
+</body>
+</html>"""
+
+def markdown_to_html_for_browser_print(md_text, print_css="", source_file_path=None, project_root=None):
+    """Convert markdown to HTML for browser printing with SVG and image support"""
+    try:
+        import markdown
+        import os
+        
+        # 1. Protect SVG by extracting it and leaving a unique text placeholder
+        placeholders = {}
+        def extract_svg_callback(match):
+            placeholder = f"svg-placeholder-{uuid.uuid4()}"
+            placeholders[placeholder] = match.group(0)
+            return placeholder
+        
+        md_text_clean = re.sub(
+            r'<svg.*?</svg>',
+            extract_svg_callback,
+            md_text,
+            flags=re.DOTALL | re.IGNORECASE
+        )
+
+        # 2. Configure and run the Markdown processor
+        extensions = [
+            'extra', 'codehilite', 'toc', 'tables', 'fenced_code', 'attr_list'
+        ]
+        extension_configs = {
+            'codehilite': {'css_class': 'highlight', 'use_pygments': True}
+        }
+        md = markdown.Markdown(
+            extensions=extensions,
+            extension_configs=extension_configs,
+            output_format='html5'
+        )
+        html_body = md.convert(md_text_clean)
+
+        # 3. Re-insert the original SVG content
+        for placeholder, svg_block in placeholders.items():
+            p_placeholder = f"<p>{placeholder}</p>"
+            if p_placeholder in html_body:
+                html_body = html_body.replace(p_placeholder, svg_block)
+            else:
+                html_body = html_body.replace(placeholder, svg_block)
+
+        # 4. Wrap the final SVG in an Iframe to isolate it from print CSS
+        def wrap_svg_in_iframe(match):
+            svg_code = match.group(0)
+            # Escape for use in the srcdoc attribute
+            escaped_svg = html.escape(svg_code)
+            # Use vh for a responsive height and a simple border
+            style = "width: 100%; height: 80vh; border: 1px solid #eee; margin: 1em auto; display: block;"
+            return f'<iframe style="{style}" srcdoc="{escaped_svg}"></iframe>'
+
+        html_body = re.sub(
+            r'<svg.*?</svg>', 
+            wrap_svg_in_iframe, 
+            html_body, 
+            flags=re.DOTALL | re.IGNORECASE
+        )
+        
+        # 5. Process standard images for print
+        html_body = process_svg_and_images_for_print(html_body, source_file_path, project_root)
+        
+        # Get title from first h1 or use filename
+        title = "Markdown Document"
+        if source_file_path:
+            title = os.path.splitext(os.path.basename(source_file_path))[0]
+        
+        h1_match = re.search(r'<h1[^>]*>([^<]+)</h1>', html_body)
+        if h1_match:
+            title = h1_match.group(1).strip()
+        
+        # Create complete HTML document
+        html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{html.escape(title)} - Print</title>
+    <style>{print_css}</style>
+</head>
+<body>
+    {html_body}
+</body>
+</html>"""
+        
+        return html_content
+        
+    except Exception as e:
+        print(f"Error in markdown_to_html_for_browser_print: {str(e)}")
+        return f"<html><body><h1>Error</h1><p>Failed to render markdown: {html.escape(str(e))}</p></body></html>"
+
+def process_svg_and_images_for_print(html_content, source_file_path=None, project_root=None):
+    """Process images for print, resolving root-relative links."""
+    import re
+    import os
+    
+    def fix_svg_for_print(match):
+        svg_content = match.group(0)
+        if 'xmlns=' not in svg_content:
+            svg_content = svg_content.replace('<svg', '<svg xmlns="http://www.w3.org/2000/svg"', 1)
+        return svg_content
+    
+    html_content = re.sub(r'<svg[^>]*>.*?</svg>', fix_svg_for_print, html_content, flags=re.DOTALL | re.IGNORECASE)
+    
+    def fix_image_for_print(match):
+        img_tag = match.group(0)
+        src_match = re.search(r'src="([^"]+)"', img_tag)
+        if not src_match: return img_tag
+        
+        original_src = src_match.group(1)
+        
+        if original_src.startswith(('http', 'https-:', 'data:', 'file:///')):
+            return img_tag
+        
+        absolute_path = None
+        base_dir = os.path.dirname(os.path.abspath(source_file_path)) if source_file_path else project_root
+        
+        if not base_dir: return img_tag
+
+        if original_src.startswith('/'):
+            # Root-relative path
+            if not project_root: return img_tag
+            absolute_path = os.path.normpath(os.path.join(project_root, original_src[1:]))
+        else:
+            # Standard relative path
+            absolute_path = os.path.normpath(os.path.join(base_dir, original_src))
+
+        if absolute_path and os.path.exists(absolute_path):
+            file_url = f"file:///{absolute_path.replace(os.sep, '/')}"
+            return img_tag.replace(f'src="{original_src}"', f'src="{file_url}"')
+        
+        return img_tag
+    
+    html_content = re.sub(r'<img[^>]+>', fix_image_for_print, html_content)
+    
+    return html_content
+
+def get_print_svg_css():
+    """Return CSS specifically for SVG support in print output with better sizing control"""
+    return _load_template("print_svg_support.tpl")
 
 class CSSManager:
     """Manages CSS loading with simple two-layer fallback system"""
@@ -40,18 +353,20 @@ class CSSManager:
                 if line_stripped.startswith('[') and line_stripped.endswith(']'):
                     if line_stripped != section_marker:
                         in_section = False
-                        continue
                 
                 if in_section:
-                    if not line_stripped.startswith('#') and line_stripped:
-                        css_lines.append(line)
-                    elif not line_stripped:
-                        css_lines.append(line)
+                    # Append the line, preserving indentation
+                    css_lines.append(line)
             
+            # Reconstruct content from the correct point
             if css_lines:
-                css_content = '\n'.join(css_lines).strip()
-                if css_content and len(css_content) > 10:
-                    return css_content
+                # Find the start of content after the marker
+                full_text = '\n'.join(css_lines)
+                content_start = full_text.find(section_marker)
+                if content_start != -1:
+                    css_content = full_text[content_start + len(section_marker):].strip()
+                    if css_content and len(css_content) > 10:
+                        return css_content
                 
         except Exception as e:
             print(f"Warning: Failed to extract CSS from config: {e}")
@@ -78,481 +393,4 @@ class CSSManager:
     
     def get_emergency_fallback_css(self):
         """Emergency CSS when all else fails"""
-        return """
-body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-    background-color: #212529;
-    color: #aaa;
-    padding: 20px;
-    margin: 0;
-    line-height: 1.6;
-    font-size: 16px;
-}
-h1, h2, h3, h4, h5, h6 { 
-    color: #ffffff; 
-    margin: 1.5em 0 1em 0;
-    font-weight: 600;
-}
-h1 { font-size: 2.5rem; border-bottom: 2px solid #495057; padding-bottom: 0.75rem; }
-h2 { font-size: 2rem; color: #ff6b6b; }
-h3 { font-size: 1.5rem; color: #007bff; }
-p { margin-bottom: 1rem; color: #ffffff; }
-code { 
-    background-color: #343a40; 
-    color: #fd7e14; 
-    padding: 0.25rem 0.5rem; 
-    border-radius: 0.375rem;
-    font-family: SFMono-Regular, Menlo, Monaco, Consolas, monospace; 
-    font-size: 0.875em;
-}
-pre { 
-    background-color: #1e2125; 
-    border: 1px solid #495057;
-    padding: 1.25rem; 
-    overflow-x: auto; 
-    margin: 1.5rem 0;
-    border-radius: 0.5rem;
-}
-pre code {
-    background: none;
-    color: #e9ecef;
-    padding: 0;
-    border: none;
-}
-blockquote {
-    border-left: 4px solid #007bff;
-    margin: 1.5rem 0;
-    padding: 1rem 1.5rem;
-    background-color: #343a40;
-    color: #ced4da;
-    font-style: italic;
-}
-"""
-
-def markdown_to_html(md_text, custom_css=None, save_temp_file=False, base_dir=None):
-    """Convert markdown text to HTML with optional custom CSS"""
-    css_manager = CSSManager()
-    
-    try:
-        extensions = [
-            'tables',
-            'fenced_code',
-            'nl2br',
-            'sane_lists',
-            'codehilite',
-            'toc',
-        ]
-        
-        extension_configs = {
-            'sane_lists': {},
-            'codehilite': {
-                'css_class': 'highlight',
-                'use_pygments': True,
-            },
-            'toc': {
-                'permalink': True,
-            }
-        }
-        
-        html_content = markdown.markdown(
-            md_text, 
-            extensions=extensions,
-            extension_configs=extension_configs
-        )
-        
-        # Fix image paths to be absolute for preview
-        if base_dir:
-            import re
-            import sys
-
-            def fix_image_path(match):
-                img_tag = match.group(0)
-                src_match = re.search(r'src="([^"]+)"', img_tag)
-                if not src_match:
-                    return img_tag
-                
-                original_src = src_match.group(1)
-
-                # Skip external URLs and file:///
-                if original_src.startswith(('http://', 'https://', 'file:///')):
-                    return img_tag
-
-                # Resolve root-relative paths like /images/foo.png
-                if original_src.startswith('/images/'):
-                    try:
-                        app_root_dir = os.path.abspath(os.path.dirname(sys.modules['__main__'].__file__))
-                        absolute_path = os.path.join(app_root_dir, original_src.lstrip('/'))
-                        if os.path.exists(absolute_path):
-                            file_url = f"file:///{absolute_path.replace(os.sep, '/')}"
-                            return img_tag.replace(f'src="{original_src}"', f'src="{file_url}"')
-                    except Exception as e:
-                        print(f"Failed to resolve /images/ path: {e}")
-                    return img_tag  # fallback
-
-                # For other relative paths (e.g., images/foo.png or ../images/foo.png)
-                absolute_path = os.path.normpath(os.path.join(base_dir, original_src))
-                if os.path.exists(absolute_path):
-                    file_url = f"file:///{absolute_path.replace(os.sep, '/')}"
-                    return img_tag.replace(f'src="{original_src}"', f'src="{file_url}"')
-                
-                return img_tag  # fallback if not found
-
-            html_content = re.sub(r'<img[^>]+>', fix_image_path, html_content)
-        
-        preview_css = css_manager.get_preview_css(custom_css)
-        
-        html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Markdown Preview</title>
-    <style>{preview_css}</style>
-</head>
-<body>
-{html_content}
-</body>
-</html>"""
-
-        if save_temp_file and base_dir:
-            import tempfile
-            temp_file = os.path.join(base_dir, '.markdown_preview_temp.html')
-            try:
-                with open(temp_file, 'w', encoding='utf-8') as f:
-                    f.write(html)
-                return temp_file
-            except Exception as e:
-                print(f"Failed to write temp file: {e}")
-                return html
-        
-        return html
-        
-    except ImportError as e:
-        try:
-            basic_extensions = ['tables', 'fenced_code']
-            html_content = markdown.markdown(
-                md_text, 
-                extensions=basic_extensions
-            )
-            preview_css = css_manager.get_preview_css(custom_css)
-            
-            html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Markdown Preview</title>
-    <style>{preview_css}</style>
-</head>
-<body>
-{html_content}
-</body>
-</html>"""
-
-            if save_temp_file and base_dir:
-                import tempfile
-                temp_file = os.path.join(base_dir, '.markdown_preview_temp.html')
-                try:
-                    with open(temp_file, 'w', encoding='utf-8') as f:
-                        f.write(html)
-                    return temp_file
-                except Exception as e:
-                    print(f"Failed to write temp file: {e}")
-                    return html
-            
-            return html
-        except Exception as fallback_error:
-            return _generate_error_html(f"Markdown processing failed: {fallback_error}")
-    
-    except Exception as e:
-        return _generate_error_html(f"Error rendering markdown: {e}")
-
-def _generate_error_html(error_message):
-    """Generate a styled error HTML page"""
-    error_css = """
-body { 
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; 
-    background-color: #121212; 
-    color: #f0f0f0; 
-    padding: 20px; 
-    margin: 0; 
-    line-height: 1.6;
-}
-.error-container { 
-    background-color: #2c1e1e; 
-    border: 1px solid #e74c3c; 
-    border-radius: 8px; 
-    padding: 24px; 
-    margin: 20px 0; 
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-}
-.error-title { 
-    color: #e74c3c; 
-    font-size: 1.4em; 
-    font-weight: 600; 
-    margin-bottom: 12px; 
-    margin-top: 0;
-}
-.error-message { 
-    color: #f0f0f0; 
-    line-height: 1.6; 
-    margin-bottom: 12px;
-    font-family: monospace;
-    background-color: #1a1a1a;
-    padding: 12px;
-    border-radius: 4px;
-    border-left: 4px solid #e74c3c;
-}
-.error-suggestion { 
-    color: #bdc3c7; 
-    font-style: italic; 
-    margin-top: 16px; 
-    padding-top: 12px;
-    border-top: 1px solid #495057;
-}
-"""
-    
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Markdown Error</title>
-    <style>{error_css}</style>
-</head>
-<body>
-    <div class="error-container">
-        <h2 class="error-title">Markdown Rendering Error</h2>
-        <div class="error-message">{error_message}</div>
-        <div class="error-suggestion">
-            Please check your markdown syntax and try again. 
-            If the problem persists, verify that all required Python packages are installed.
-        </div>
-    </div>
-</body>
-</html>"""
-
-def del_markdown_to_html_for_print(md_text, print_css=""):
-    """Convert markdown to HTML specifically optimized for printing"""
-    import time
-    import hashlib
-    
-    try:
-        import markdown
-        
-        # Configure markdown extensions for print
-        extensions = [
-            'extra',
-            'codehilite',
-            'toc',
-            'tables',
-            'fenced_code'
-        ]
-        
-        extension_configs = {
-            'codehilite': {
-                'css_class': 'highlight',
-                'use_pygments': True
-            }
-        }
-        
-        # Create markdown instance
-        md = markdown.Markdown(
-            extensions=extensions,
-            extension_configs=extension_configs
-        )
-        
-        # Convert markdown to HTML
-        html_body = md.convert(md_text)
-        
-        # Create a hash of the CSS for cache busting
-        css_hash = hashlib.md5(print_css.encode('utf-8')).hexdigest()[:8] if print_css else "default"
-        timestamp = int(time.time())
-        
-        # Ensure we have some CSS
-        if not print_css or len(print_css) < 100:
-            print("Warning: Using minimal fallback CSS for print")
-            print_css = """
-            body { font-family: Arial, sans-serif; font-size: 12pt; color: black; background: white; }
-            h1 { font-size: 20pt; }
-            h2 { font-size: 16pt; }
-            h3 { font-size: 14pt; }
-            h4 { font-size: 12pt; }
-            p, li { font-size: 12pt; }
-            strong, b { font-size: inherit; font-weight: bold; }
-            """
-        
-        # Add cache-busting comment to CSS
-        cache_busted_css = f"/* Cache: {css_hash}-{timestamp} */\n{print_css}"
-        
-        # Create complete HTML document with print CSS embedded
-        html_content = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Print Document</title>
-    <style>
-        {cache_busted_css}
-    </style>
-</head>
-<body>
-    {html_body}
-</body>
-</html>"""
-        
-        print(f"Generated print HTML with CSS hash: {css_hash}")
-        return html_content
-        
-    except ImportError:
-        # Fallback if markdown not available
-        html_body = md_text.replace('\n\n', '</p><p>').replace('\n', '<br>')
-        html_body = f"<p>{html_body}</p>"
-        
-        return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Print Document</title>
-    <style>
-        {print_css if print_css else "body { font-family: Arial, sans-serif; font-size: 12pt; }"}
-    </style>
-</head>
-<body>
-    {html_body}
-</body>
-</html>"""
-        
-    except Exception as e:
-        print(f"Error in markdown_to_html_for_print: {str(e)}")
-        # Return simple fallback
-        html_body = md_text.replace('\n\n', '</p><p>').replace('\n', '<br>')
-        html_body = f"<p>{html_body}</p>"
-        
-        return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Print Document</title>
-    <style>
-        {print_css if print_css else "body { font-family: Arial, sans-serif; font-size: 12pt; }"}
-    </style>
-</head>
-<body>
-    {html_body}
-</body>
-</html>"""
-    
-def markdown_to_html_for_browser_print(md_text, print_css="", source_file_path=None):
-    """Convert markdown to HTML for browser printing with image support"""
-    try:
-        import markdown
-        import os
-        
-        # Configure markdown extensions for print
-        extensions = [
-            'extra',
-            'codehilite',
-            'toc',
-            'tables',
-            'fenced_code'
-        ]
-        
-        extension_configs = {
-            'codehilite': {
-                'css_class': 'highlight',
-                'use_pygments': True
-            }
-        }
-        
-        # Create markdown instance
-        md = markdown.Markdown(
-            extensions=extensions,
-            extension_configs=extension_configs
-        )
-        
-        # Convert markdown to HTML
-        html_body = md.convert(md_text)
-        
-        # Fix image paths to be relative to the source file
-        if source_file_path:
-            source_dir = os.path.dirname(os.path.abspath(source_file_path))
-            
-            # Find and fix image references
-            import re
-            def fix_image_path(match):
-                img_tag = match.group(0)
-                src_match = re.search(r'src="([^"]+)"', img_tag)
-                if src_match:
-                    original_src = src_match.group(1)
-                    
-                    # Skip if already absolute path or URL
-                    if original_src.startswith(('http://', 'https://', 'file://', '/')):
-                        return img_tag
-                    
-                    # Convert relative path to absolute path
-                    absolute_path = os.path.join(source_dir, original_src)
-                    if os.path.exists(absolute_path):
-                        file_url = f"file:///{absolute_path.replace(os.sep, '/')}"
-                        return img_tag.replace(f'src="{original_src}"', f'src="{file_url}"')
-                    else:
-                        # Image not found, add a note
-                        return f'<div style="border: 1px dashed #ccc; padding: 12pt; margin: 6pt 0; text-align: center; font-style: italic; color: #666;">[Image not found: {original_src}]</div>'
-                
-                return img_tag
-            
-            html_body = re.sub(r'<img[^>]+>', fix_image_path, html_body)
-        
-        # Get title from first h1 or use filename
-        title = "Markdown Document"
-        if source_file_path:
-            title = os.path.splitext(os.path.basename(source_file_path))[0]
-        
-        # Look for first h1 in content
-        import re
-        h1_match = re.search(r'<h1[^>]*>([^<]+)</h1>', html_body)
-        if h1_match:
-            title = h1_match.group(1)
-        
-        # Create complete HTML document using provided CSS
-        html_content = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{title} - Print</title>
-    <style>
-        {print_css}
-    </style>
-</head>
-<body>
-    {html_body}
-</body>
-</html>"""
-        
-        return html_content
-        
-    except ImportError:
-        # Fallback if markdown not available
-        html_body = md_text.replace('\n\n', '</p><p>').replace('\n', '<br>')
-        html_body = f"<p>{html_body}</p>"
-        
-        return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Print Document</title>
-    <style>
-        {print_css if print_css else "body { font-family: Arial; font-size: 12pt; }"}
-    </style>
-</head>
-<body>
-    {html_body}
-</body>
-</html>"""
-        
-    except Exception as e:
-        print(f"Error in markdown_to_html_for_browser_print: {str(e)}")
-        return f"<html><body><h1>Error</h1><p>Failed to render markdown: {str(e)}</p></body></html>"
+        return _load_template("fallback_preview.tpl")
