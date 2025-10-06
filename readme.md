@@ -136,6 +136,7 @@ description: "Brief description"
 
 ## To Do
 
+- make nix friendly (libraries and file paths not correct currently)
 - Code refactor, clean up, make DRY
 - Separate out gui into multiple files
 - Clean up documentation to match final project/goals
@@ -146,6 +147,7 @@ description: "Brief description"
 - remove/consolidate css/templates vs multiple locations
 - small task tracker that reminds on specific notes
 - Test on Pi/Debian
+
 
 
 
