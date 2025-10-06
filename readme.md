@@ -6,7 +6,7 @@ A sophisticated, cross-platform markdown editor and file manager built with PyQt
 
 ## Application Preview
 
-![Markdown Manager Demo1](docs/demov17.gif)
+![Markdown Manager Demo1](docs/demov20.gif)
 
 ---
 
@@ -146,6 +146,7 @@ description: "Brief description"
 - remove/consolidate css/templates vs multiple locations
 - small task tracker that reminds on specific notes
 - Test on Pi/Debian
+
 
 
 
